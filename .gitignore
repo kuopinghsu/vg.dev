@@ -1,0 +1,52 @@
+# Build outputs
+build/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# Generated images
+*.ppm
+*.tga
+*.png.tmp
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# CTS reference data is checked in; ignore generated CTS outputs
+sw/cts/data/output/
+sw/cts/data/results/
+
+# RI reference build artefacts
+sw/ri/build/
+
+# Synthesis / simulation
+syn/work/
+syn/output/
+testbench/work/
+testbench/*.vcd
+testbench/*.fst
+testbench/*.log
+
+# Memory / agent scratch
+.copilot/
