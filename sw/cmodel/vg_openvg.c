@@ -326,16 +326,31 @@ static void load_matrix_to_cmodel(cm_ctx_t *ctx)
  * Paint helpers
  * ========================================================================= */
 
+/* Apply VG_COLOR_TRANSFORM to an RGBA color in-place. */
+static void apply_color_transform(cm_ctx_t *ctx, float c[4])
+{
+    if (!ctx->color_transform) return;
+    const VGfloat *cv = ctx->color_transform_values;
+    c[0] = clampf01(c[0] * cv[0] + cv[4]);
+    c[1] = clampf01(c[1] * cv[1] + cv[5]);
+    c[2] = clampf01(c[2] * cv[2] + cv[6]);
+    c[3] = clampf01(c[3] * cv[3] + cv[7]);
+}
+
 static void load_paint_to_cmodel(cm_ctx_t *ctx, cm_paint_t *paint)
 {
     if (!paint) paint = &g_default_fill_paint;
     vg_cmodel_t cm = ctx->surface->cm;
 
     switch (paint->type) {
-    case VG_PAINT_TYPE_COLOR:
+    case VG_PAINT_TYPE_COLOR: {
         vg_cmodel_reg_write(cm, VG_REG_GRAD_TYPE, VG_GRAD_NONE);
-        vg_cmodel_reg_write(cm, VG_REG_FILL_COLOR, pack_rgba(paint->color));
+        float c[4] = { paint->color[0], paint->color[1],
+                       paint->color[2], paint->color[3] };
+        apply_color_transform(ctx, c);
+        vg_cmodel_reg_write(cm, VG_REG_FILL_COLOR, pack_rgba(c));
         break;
+    }
     case VG_PAINT_TYPE_LINEAR_GRADIENT: {
         vg_cmodel_reg_write(cm, VG_REG_GRAD_TYPE, VG_GRAD_LINEAR);
         /* In OpenVG, gradient coords are in paint (user) space.
@@ -348,8 +363,10 @@ static void load_paint_to_cmodel(cm_ctx_t *ctx, cm_paint_t *paint)
         int ns = paint->num_stops < 16 ? paint->num_stops : 16;
         for (int i = 0; i < ns; i++) {
             vg_cmodel_reg_write_f(cm, VG_REG_CRAMP_OFFSET(i), paint->stops[i].offset);
-            vg_cmodel_reg_write(cm, VG_REG_CRAMP_COLOR(i),
-                                pack_rgba(paint->stops[i].color));
+            float sc[4] = { paint->stops[i].color[0], paint->stops[i].color[1],
+                            paint->stops[i].color[2], paint->stops[i].color[3] };
+            apply_color_transform(ctx, sc);
+            vg_cmodel_reg_write(cm, VG_REG_CRAMP_COLOR(i), pack_rgba(sc));
         }
         vg_cmodel_reg_write(cm, VG_REG_CRAMP_COUNT, (uint32_t)ns);
         vg_cmodel_reg_write(cm, VG_REG_GRAD_SPREAD, (uint32_t)paint->spread_mode);
@@ -367,8 +384,10 @@ static void load_paint_to_cmodel(cm_ctx_t *ctx, cm_paint_t *paint)
         int ns = paint->num_stops < 16 ? paint->num_stops : 16;
         for (int i = 0; i < ns; i++) {
             vg_cmodel_reg_write_f(cm, VG_REG_CRAMP_OFFSET(i), paint->stops[i].offset);
-            vg_cmodel_reg_write(cm, VG_REG_CRAMP_COLOR(i),
-                                pack_rgba(paint->stops[i].color));
+            float rc[4] = { paint->stops[i].color[0], paint->stops[i].color[1],
+                            paint->stops[i].color[2], paint->stops[i].color[3] };
+            apply_color_transform(ctx, rc);
+            vg_cmodel_reg_write(cm, VG_REG_CRAMP_COLOR(i), pack_rgba(rc));
         }
         vg_cmodel_reg_write(cm, VG_REG_CRAMP_COUNT, (uint32_t)ns);
         vg_cmodel_reg_write(cm, VG_REG_GRAD_SPREAD, (uint32_t)paint->spread_mode);
@@ -1649,7 +1668,15 @@ static void emit_polygon(cm_path_t *dst, const ptlist_t *l){
     sp_close(dst);
 }
 
-/* ---- Build stroke polygon for one subpath (polyline) ---- */
+/* ---- Build stroke as multiple separate closed sub-paths ---- */
+/*
+ * Design: emit one closed quadrilateral per segment, then one closed
+ * triangle/fan per outside join, and one closed cap per endpoint.
+ * Using separate closed sub-paths avoids the self-intersection problem
+ * that arises with a single-polygon approach for sharp inside turns.
+ * With the NON_ZERO fill rule, overlapping sub-paths simply add their
+ * winding counts; the union is filled correctly.
+ */
 static void stroke_subpath(cm_path_t *dst,
                             const sv2 *pts, int n, int closed,
                             float hw,
@@ -1657,197 +1684,162 @@ static void stroke_subpath(cm_path_t *dst,
 {
     if(n < 2) return;
 
-    /* Build arrays of per-segment tangents and normals */
-    int ns = closed ? n : n - 1; /* number of segments */
+    int ns = closed ? n : n - 1;
     sv2 *tang  = (sv2 *)malloc((size_t)ns * sizeof(sv2));
     sv2 *norml = (sv2 *)malloc((size_t)ns * sizeof(sv2));
     if(!tang || !norml){ free(tang); free(norml); return; }
 
-    for(int i=0;i<ns;i++){
+    for(int i = 0; i < ns; i++){
         sv2 t = sv2_norm(sv2_sub(pts[(i+1)%n], pts[i]));
         tang[i]  = t;
-        norml[i] = sv2_perp(t);  /* left normal */
+        norml[i] = sv2_perp(t);
     }
 
-    /* ---- Build the outline polygon ---- */
-    ptlist_t poly = {NULL,0,0};
-
-    /* ------- Left side (forward traversal) ------- */
-    /* Start cap (open path only) */
-    if(!closed){
-        sv2 p0 = pts[0];
-        sv2 n0 = norml[0];
-        sv2 t0 = tang[0];
-        if(cap == VG_CAP_ROUND){
-            float a_start = atan2f( n0.y,  n0.x);
-            float a_end   = atan2f(-n0.y, -n0.x);
-            ptl_push(&poly, sv2_add(p0, sv2_sc(n0, hw)));
-            add_arc_pts(&poly, p0, hw, a_start, a_end, 0); /* CW sweep */
-            /* the arc ends at p0 - hw*n0, which is on the right side */
-        } else if(cap == VG_CAP_SQUARE){
-            ptl_push(&poly, sv2_add(sv2_sub(p0, sv2_sc(t0, hw)), sv2_sc(n0, hw)));
-            /* left start corner, then continue left side */
-        } else { /* BUTT */
-            ptl_push(&poly, sv2_add(p0, sv2_sc(n0, hw)));
-        }
+    /* ---- 1. Segment quads ---- */
+    for(int i = 0; i < ns; i++){
+        sv2 p0 = pts[i];
+        sv2 p1 = pts[(i+1)%n];
+        sv2 nrm = norml[i];
+        sv2 l0 = sv2_add(p0, sv2_sc(nrm, hw));
+        sv2 l1 = sv2_add(p1, sv2_sc(nrm, hw));
+        sv2 r1 = sv2_sub(p1, sv2_sc(nrm, hw));
+        sv2 r0 = sv2_sub(p0, sv2_sc(nrm, hw));
+        sp_move(dst, l0);
+        sp_line(dst, l1);
+        sp_line(dst, r1);
+        sp_line(dst, r0);
+        sp_close(dst);
     }
 
-    /* Left offsets along the path */
-    if(!closed)
-        ptl_push(&poly, sv2_add(pts[0], sv2_sc(norml[0], hw)));
-
-    for(int i=0; i<n-1-(closed?0:1); i++){
-        int i_next = (i+1) % ns;
-        sv2 pj = pts[(i+1)%n]; /* join point */
-        sv2 n_cur  = norml[i];
-        sv2 n_next = norml[i_next];
-        sv2 t_cur  = tang[i];
-        sv2 t_next = tang[i_next];
+    /* ---- 2. Joins (outside corner only) ---- */
+    int n_joints = closed ? n : n - 2;
+    for(int j = 0; j < n_joints; j++){
+        int i_seg  = closed ? j : j;           /* segment before joint   */
+        int i_next = (i_seg + 1) % ns;         /* segment after joint    */
+        int ip1    = (i_seg + 1) % n;          /* joint vertex index     */
+        sv2 pj      = pts[ip1];
+        sv2 t_cur   = tang[i_seg];
+        sv2 t_next  = tang[i_next];
+        sv2 n_cur   = norml[i_seg];
+        sv2 n_next  = norml[i_next];
 
         float cross = sv2_cross(t_cur, t_next);
-        /* cross > 0 means left turn (outside is left), cross < 0 = right turn */
+        if(fabsf(cross) < 1e-6f) continue;     /* nearly straight, no join needed */
 
-        sv2 l_end   = sv2_add(pj, sv2_sc(n_cur,  hw)); /* end of current left offset at join */
-        sv2 l_start = sv2_add(pj, sv2_sc(n_next, hw)); /* start of next left offset at join */
+        /* outside_end / outside_start: the two offset vertices at the join
+         * on the OUTSIDE of the turn */
+        sv2 outside_end, outside_start;
+        if(cross > 0.f){
+            /* left/CCW turn: n points inward (toward interior), exterior gap is on -n side */
+            outside_end   = sv2_sub(pj, sv2_sc(n_cur,  hw));
+            outside_start = sv2_sub(pj, sv2_sc(n_next, hw));
+        } else {
+            /* right/CW turn: n points outward, exterior gap is on +n side */
+            outside_end   = sv2_add(pj, sv2_sc(n_cur,  hw));
+            outside_start = sv2_add(pj, sv2_sc(n_next, hw));
+        }
 
-        if(cross > 1e-6f){
-            /* Left turn: outside is the left side → add join geometry */
-            if(join == VG_JOIN_MITER){
-                /* Find miter point = intersection of the two offset lines */
-                sv2 d = sv2_sub(l_start, l_end);
-                float denom = sv2_cross(t_cur, t_next);
-                if(fabsf(denom) > 1e-9f){
-                    float s = sv2_cross(d, t_next) / denom;
-                    sv2 mpt = sv2_add(l_end, sv2_sc(t_cur, s));
-                    float md = sv2_len(sv2_sub(mpt, pj));
-                    if(md <= miter_lim * hw){
-                        ptl_push(&poly, mpt);
-                    } else {
-                        /* Miter limit exceeded → bevel */
-                        ptl_push(&poly, l_end);
-                        ptl_push(&poly, l_start);
-                    }
-                } else {
-                    ptl_push(&poly, l_end);
-                    ptl_push(&poly, l_start);
-                }
-            } else if(join == VG_JOIN_ROUND){
-                float a0 = atan2f(n_cur.y,  n_cur.x);
-                float a1 = atan2f(n_next.y, n_next.x);
-                ptl_push(&poly, l_end);
-                add_arc_pts(&poly, pj, hw, a0, a1, 1); /* CCW */
-            } else { /* BEVEL */
-                ptl_push(&poly, l_end);
-                ptl_push(&poly, l_start);
-            }
-        } else if(cross < -1e-6f){
-            /* Right turn: outside is the right side → left side is inside */
-            /* Intersect left offset lines to find the inside corner */
-            sv2 d = sv2_sub(l_start, l_end);
+        if(join == VG_JOIN_MITER){
+            /* Miter point = intersection of the two outside offset lines */
+            sv2 d = sv2_sub(outside_start, outside_end);
             float denom = sv2_cross(t_cur, t_next);
+            int done = 0;
             if(fabsf(denom) > 1e-9f){
                 float s = sv2_cross(d, t_next) / denom;
-                ptl_push(&poly, sv2_add(l_end, sv2_sc(t_cur, s)));
-            } else {
-                ptl_push(&poly, l_end);
-            }
-        } else {
-            /* Straight or near-180° → just emit the offset point */
-            ptl_push(&poly, l_end);
-        }
-    }
-
-    /* End of left side */
-    if(!closed){
-        sv2 pe = pts[n-1];
-        sv2 ne = norml[ns-1];
-        sv2 te = tang[ns-1];
-        ptl_push(&poly, sv2_add(pe, sv2_sc(ne, hw)));
-
-        /* End cap */
-        if(cap == VG_CAP_ROUND){
-            float a_start = atan2f( ne.y,  ne.x);
-            float a_end   = atan2f(-ne.y, -ne.x);
-            add_arc_pts(&poly, pe, hw, a_start, a_end, 0); /* CW */
-        } else if(cap == VG_CAP_SQUARE){
-            ptl_push(&poly, sv2_add(sv2_add(pe, sv2_sc(te, hw)), sv2_sc(ne, hw)));
-            ptl_push(&poly, sv2_sub(sv2_add(pe, sv2_sc(te, hw)), sv2_sc(ne, hw)));
-        }
-        /* BUTT: right side starts immediately */
-        ptl_push(&poly, sv2_sub(pe, sv2_sc(ne, hw)));
-    }
-
-    /* ------- Right side (reverse traversal) ------- */
-    for(int i = closed ? n-1 : n-2; i >= (closed ? 0 : 0); i--){
-        int i_seg = closed ? (i == n-1 ? ns-1 : i) : i; /* segment index */
-        int i_seg_prev = (i_seg - 1 + ns) % ns;
-        sv2 pj = pts[i];  /* for closed, handle wrap */
-        if(!closed && i == n-1) continue; /* end handled above */
-
-        sv2 n_cur  = sv2_sc(norml[i_seg], -1.f);       /* right normal = -left */
-        sv2 n_prev = sv2_sc(norml[i_seg_prev], -1.f);
-        sv2 t_rev  = sv2_sc(tang[i_seg_prev], -1.f);   /* reversed tangent */
-        sv2 t_cur  = sv2_sc(tang[i_seg], -1.f);
-
-        if(i == 0 && !closed) break; /* already handled */
-
-        sv2 r_end   = sv2_add(pj, sv2_sc(sv2_sc(norml[i_seg], -1.f), hw));
-        sv2 r_start = sv2_add(pj, sv2_sc(sv2_sc(norml[i_seg_prev], -1.f), hw));
-
-        float cross = sv2_cross(t_rev, t_cur); /* > 0 = left turn in reverse = right turn in forward */
-
-        if(cross > 1e-6f){
-            /* Outside on right side (reverse traversal left turn) */
-            if(join == VG_JOIN_MITER){
-                sv2 d = sv2_sub(r_start, r_end);
-                float denom = sv2_cross(t_rev, t_cur);
-                if(fabsf(denom) > 1e-9f){
-                    float s = sv2_cross(d, t_cur) / denom;
-                    sv2 mpt = sv2_add(r_end, sv2_sc(t_rev, s));
-                    float md = sv2_len(sv2_sub(mpt, pj));
-                    if(md <= miter_lim * hw){
-                        ptl_push(&poly, mpt);
-                    } else {
-                        ptl_push(&poly, r_end);
-                        ptl_push(&poly, r_start);
-                    }
-                } else {
-                    ptl_push(&poly, r_end);
-                    ptl_push(&poly, r_start);
+                sv2 mpt = sv2_add(outside_end, sv2_sc(t_cur, s));
+                float md = sv2_len(sv2_sub(mpt, pj));
+                if(md <= miter_lim * hw){
+                    /* Emit the miter triangle: pj → outside_end → mpt → outside_start */
+                    sp_move(dst, pj);
+                    sp_line(dst, outside_end);
+                    sp_line(dst, mpt);
+                    sp_line(dst, outside_start);
+                    sp_close(dst);
+                    done = 1;
                 }
-            } else if(join == VG_JOIN_ROUND){
-                float a0 = atan2f(n_cur.y, n_cur.x);
-                float a1 = atan2f(n_prev.y, n_prev.x);
-                ptl_push(&poly, r_end);
-                add_arc_pts(&poly, pj, hw, a0, a1, 1);
-            } else {
-                ptl_push(&poly, r_end);
-                ptl_push(&poly, r_start);
             }
-        } else if(cross < -1e-6f){
-            /* Inside on right (forward right turn) */
-            sv2 d = sv2_sub(r_start, r_end);
-            float denom = sv2_cross(t_rev, t_cur);
-            if(fabsf(denom) > 1e-9f){
-                float s = sv2_cross(d, t_cur) / denom;
-                ptl_push(&poly, sv2_add(r_end, sv2_sc(t_rev, s)));
-            } else {
-                ptl_push(&poly, r_end);
+            if(!done){
+                /* Bevel fallback */
+                sp_move(dst, pj);
+                sp_line(dst, outside_end);
+                sp_line(dst, outside_start);
+                sp_close(dst);
             }
+        } else if(join == VG_JOIN_ROUND){
+            /* Round join: arc from outside_end to outside_start around pj */
+            float a0 = atan2f(outside_end.y   - pj.y, outside_end.x   - pj.x);
+            float a1 = atan2f(outside_start.y - pj.y, outside_start.x - pj.x);
+            ptlist_t arc = {NULL,0,0};
+            ptl_push(&arc, pj);
+            ptl_push(&arc, outside_end);
+            /* sweep in the direction that spans the outside of the turn */
+            int ccw = (cross > 0.f) ? 1 : 0;
+            add_arc_pts(&arc, pj, hw, a0, a1, ccw);
+            ptl_push(&arc, outside_start);
+            emit_polygon(dst, &arc);
+            ptl_free(&arc);
         } else {
-            ptl_push(&poly, r_end);
+            /* Bevel: simple triangle */
+            sp_move(dst, pj);
+            sp_line(dst, outside_end);
+            sp_line(dst, outside_start);
+            sp_close(dst);
         }
     }
 
-    if(!closed)
-        ptl_push(&poly, sv2_sub(pts[0], sv2_sc(norml[0], hw)));
+    /* ---- 3. Caps (open paths only) ---- */
+    if(!closed){
+        /* -- Start cap -- */
+        sv2 p0  = pts[0];
+        sv2 n0  = norml[0];
+        sv2 t0  = tang[0];
+        sv2 l0  = sv2_add(p0, sv2_sc(n0, hw));
+        sv2 r0  = sv2_sub(p0, sv2_sc(n0, hw));
+        if(cap == VG_CAP_SQUARE){
+            sv2 back = sv2_sc(t0, -hw);
+            sp_move(dst, sv2_add(l0, back));
+            sp_line(dst, sv2_add(r0, back));
+            sp_line(dst, r0);
+            sp_line(dst, l0);
+            sp_close(dst);
+        } else if(cap == VG_CAP_ROUND){
+            float a0 = atan2f(-n0.y, -n0.x); /* = atan2(r0-p0) direction */
+            float a1 = atan2f(n0.y,  n0.x);
+            ptlist_t arc = {NULL,0,0};
+            ptl_push(&arc, l0);
+            add_arc_pts(&arc, p0, hw, a1, a0, 1); /* CCW: from l0 side BACKWARD to r0 side (outside cap) */
+            ptl_push(&arc, r0);
+            emit_polygon(dst, &arc);
+            ptl_free(&arc);
+        }
+        /* BUTT: no cap needed (segment quad already ends at the endpoint) */
 
-    /* Start cap (open path) - right side completion */
-    if(!closed && cap == VG_CAP_SQUARE)
-        ptl_push(&poly, sv2_sub(sv2_sub(pts[0], sv2_sc(tang[0], hw)), sv2_sc(norml[0], hw)));
+        /* -- End cap -- */
+        sv2 pe  = pts[n-1];
+        sv2 ne  = norml[ns-1];
+        sv2 te  = tang[ns-1];
+        sv2 le  = sv2_add(pe, sv2_sc(ne, hw));
+        sv2 re  = sv2_sub(pe, sv2_sc(ne, hw));
+        if(cap == VG_CAP_SQUARE){
+            sv2 fwd = sv2_sc(te, hw);
+            sp_move(dst, sv2_add(le, fwd));
+            sp_line(dst, sv2_add(re, fwd));
+            sp_line(dst, re);
+            sp_line(dst, le);
+            sp_close(dst);
+        } else if(cap == VG_CAP_ROUND){
+            float a0 = atan2f( ne.y,  ne.x);
+            float a1 = atan2f(-ne.y, -ne.x);
+            ptlist_t arc = {NULL,0,0};
+            ptl_push(&arc, le);
+            add_arc_pts(&arc, pe, hw, a0, a1, 0); /* CW */
+            ptl_push(&arc, re);
+            emit_polygon(dst, &arc);
+            ptl_free(&arc);
+        }
+        /* BUTT: no cap */
+    }
 
-    emit_polygon(dst, &poly);
-    ptl_free(&poly);
     free(tang);
     free(norml);
 }
@@ -2899,103 +2891,126 @@ void vgDrawImage(VGImage image)
                 s[2] = clampf01(img_lin2srgb(s[2]));
             }
 
-            /* Color transform */
-            if (g_ctx->color_transform) {
-                const VGfloat *cv = g_ctx->color_transform_values;
-                s[0] = clampf01(s[0] * cv[0] + cv[4]);
-                s[1] = clampf01(s[1] * cv[1] + cv[5]);
-                s[2] = clampf01(s[2] * cv[2] + cv[6]);
-                s[3] = clampf01(s[3] * cv[3] + cv[7]);
-            }
+            /* Apply color transform and compute premultiplied source for blending.
+             * Matches RI: NORMAL/MULTIPLY CT on image (or product),
+             * STENCIL CT on paint only; STENCIL uses per-channel alphas. */
+            float sa, ar, ag, ab;
+            float sp[3];
 
-            /* Image mode */
-            float src[4];
             if (imode == VG_DRAW_IMAGE_STENCIL) {
-                float ia = s[3];
-                src[0] = fp[0] * ia; src[1] = fp[1] * ia;
-                src[2] = fp[2] * ia; src[3] = fp[3] * ia;
+                /* CT applied to PAINT, image channels act as per-channel stencil */
+                float paint[4] = { fp[0], fp[1], fp[2], fp[3] };
+                if (g_ctx->color_transform) {
+                    const VGfloat *cv = g_ctx->color_transform_values;
+                    paint[0] = clampf01(paint[0]*cv[0]+cv[4]);
+                    paint[1] = clampf01(paint[1]*cv[1]+cv[5]);
+                    paint[2] = clampf01(paint[2]*cv[2]+cv[6]);
+                    paint[3] = clampf01(paint[3]*cv[3]+cv[7]);
+                }
+                float image_a = s[3];
+                /* per-channel alphas: paint_a * image_a * image_channel */
+                sa = paint[3] * image_a;
+                ar = sa * s[0];
+                ag = sa * s[1];
+                ab = sa * s[2];
+                /* premultiplied source channels: paint_channel * per-channel-alpha */
+                sp[0] = paint[0] * ar;
+                sp[1] = paint[1] * ag;
+                sp[2] = paint[2] * ab;
             } else if (imode == VG_DRAW_IMAGE_MULTIPLY) {
-                src[0] = s[0] * fp[0]; src[1] = s[1] * fp[1];
-                src[2] = s[2] * fp[2]; src[3] = s[3] * fp[3];
+                /* CT applied to paint*image product */
+                float prod[4] = { s[0]*fp[0], s[1]*fp[1], s[2]*fp[2], s[3]*fp[3] };
+                if (g_ctx->color_transform) {
+                    const VGfloat *cv = g_ctx->color_transform_values;
+                    prod[0] = clampf01(prod[0]*cv[0]+cv[4]);
+                    prod[1] = clampf01(prod[1]*cv[1]+cv[5]);
+                    prod[2] = clampf01(prod[2]*cv[2]+cv[6]);
+                    prod[3] = clampf01(prod[3]*cv[3]+cv[7]);
+                }
+                sa = prod[3]; ar = ag = ab = sa;
+                sp[0]=prod[0]*sa; sp[1]=prod[1]*sa; sp[2]=prod[2]*sa;
             } else {
-                src[0] = s[0]; src[1] = s[1]; src[2] = s[2]; src[3] = s[3];
+                /* NORMAL: CT applied to image */
+                if (g_ctx->color_transform) {
+                    const VGfloat *cv = g_ctx->color_transform_values;
+                    s[0] = clampf01(s[0]*cv[0]+cv[4]);
+                    s[1] = clampf01(s[1]*cv[1]+cv[5]);
+                    s[2] = clampf01(s[2]*cv[2]+cv[6]);
+                    s[3] = clampf01(s[3]*cv[3]+cv[7]);
+                }
+                sa = s[3]; ar = ag = ab = sa;
+                sp[0]=s[0]*sa; sp[1]=s[1]*sa; sp[2]=s[2]*sa;
             }
 
             /* Read destination pixel from framebuffer (RGBA8888: 0xRRGGBBAA) */
             int fb_row = SH - 1 - vy;
             uint32_t *dst_px = &fb[(uint32_t)fb_row * (uint32_t)SW + (uint32_t)vx];
-            uint32_t dp = *dst_px;
-            float d[4] = { ((dp >> 24) & 0xFF) / 255.f,
-                           ((dp >> 16) & 0xFF) / 255.f,
-                           ((dp >>  8) & 0xFF) / 255.f,
-                           ( dp        & 0xFF) / 255.f };
+            uint32_t dst_packed = *dst_px;
+            float d[4] = { ((dst_packed >> 24) & 0xFF) / 255.f,
+                           ((dst_packed >> 16) & 0xFF) / 255.f,
+                           ((dst_packed >>  8) & 0xFF) / 255.f,
+                           ( dst_packed        & 0xFF) / 255.f };
 
-            /* Porter-Duff blend */
-            float sa = src[3], da = d[3];
-            float out[4];
+            /* Porter-Duff blend matching RI: operates on premultiplied sRGB.
+             * Per-channel alphas ar/ag/ab (= sa for NORMAL/MULTIPLY, differ for STENCIL). */
+            float da = d[3];
+            float dp[3] = { d[0]*da, d[1]*da, d[2]*da };
+            float rp[3]; float ra;
             switch (bm) {
             case 0: /* SRC */
-                out[0]=src[0]; out[1]=src[1]; out[2]=src[2]; out[3]=sa; break;
-            case 1: /* SRC_OVER */
-                out[3] = sa + da*(1.f-sa);
-                if (out[3] > 1e-6f) {
-                    out[0] = (src[0]*sa + d[0]*da*(1.f-sa)) / out[3];
-                    out[1] = (src[1]*sa + d[1]*da*(1.f-sa)) / out[3];
-                    out[2] = (src[2]*sa + d[2]*da*(1.f-sa)) / out[3];
-                } else { out[0]=out[1]=out[2]=0.f; }
-                break;
+                rp[0]=sp[0]; rp[1]=sp[1]; rp[2]=sp[2]; ra=sa; break;
+            case 1: /* SRC_OVER: r_c=sp+dp*(1-ar_c); r_a=sa+da*(1-sa) */
+                ra = sa + da*(1.f-sa);
+                rp[0]=sp[0]+dp[0]*(1.f-ar);
+                rp[1]=sp[1]+dp[1]*(1.f-ag);
+                rp[2]=sp[2]+dp[2]*(1.f-ab); break;
             case 2: /* DST_OVER */
-                out[3] = da + sa*(1.f-da);
-                if (out[3] > 1e-6f) {
-                    out[0] = (d[0]*da + src[0]*sa*(1.f-da)) / out[3];
-                    out[1] = (d[1]*da + src[1]*sa*(1.f-da)) / out[3];
-                    out[2] = (d[2]*da + src[2]*sa*(1.f-da)) / out[3];
-                } else { out[0]=out[1]=out[2]=0.f; }
-                break;
+                ra = sa*(1.f-da)+da;
+                rp[0]=sp[0]*(1.f-da)+dp[0];
+                rp[1]=sp[1]*(1.f-da)+dp[1];
+                rp[2]=sp[2]*(1.f-da)+dp[2]; break;
             case 3: /* SRC_IN */
-                out[3] = sa * da;
-                out[0] = (out[3] > 1e-6f) ? src[0] : 0.f;
-                out[1] = (out[3] > 1e-6f) ? src[1] : 0.f;
-                out[2] = (out[3] > 1e-6f) ? src[2] : 0.f;
-                break;
-            case 4: /* DST_IN */
-                out[3] = da * sa;
-                out[0] = (out[3] > 1e-6f) ? d[0] : 0.f;
-                out[1] = (out[3] > 1e-6f) ? d[1] : 0.f;
-                out[2] = (out[3] > 1e-6f) ? d[2] : 0.f;
-                break;
-            case 5: /* MULTIPLY */
-                out[0]=src[0]*d[0]; out[1]=src[1]*d[1]; out[2]=src[2]*d[2];
-                out[3]=clampf01(sa+da-sa*da); break;
-            case 6: /* SCREEN */
-                out[0]=src[0]+d[0]-src[0]*d[0];
-                out[1]=src[1]+d[1]-src[1]*d[1];
-                out[2]=src[2]+d[2]-src[2]*d[2];
-                out[3]=clampf01(sa+da-sa*da); break;
-            case 7: /* DARKEN */
-                out[3] = clampf01(sa+da-sa*da);
-                for (int c=0;c<3;c++) {
-                    float f1 = src[c]*sa + d[c]*da*(1.f-sa);
-                    float f2 =   d[c]*da + src[c]*sa*(1.f-da);
-                    float op = fminf(f1,f2);
-                    out[c] = (out[3] > 1e-6f) ? (op/out[3]) : 0.f;
-                }
-                break;
-            case 8: /* LIGHTEN */
-                out[3] = clampf01(sa+da-sa*da);
-                for (int c=0;c<3;c++) {
-                    float f1 = src[c]*sa + d[c]*da*(1.f-sa);
-                    float f2 =   d[c]*da + src[c]*sa*(1.f-da);
-                    float op = fmaxf(f1,f2);
-                    out[c] = (out[3] > 1e-6f) ? (op/out[3]) : 0.f;
-                }
-                break;
+                ra=sa*da;
+                rp[0]=sp[0]*da; rp[1]=sp[1]*da; rp[2]=sp[2]*da; break;
+            case 4: /* DST_IN: r_c=dp*ar_c; r_a=da*sa */
+                ra=da*sa;
+                rp[0]=dp[0]*ar; rp[1]=dp[1]*ag; rp[2]=dp[2]*ab; break;
+            case 5: /* MULTIPLY: r_c=sp*(1-da+dp)+dp*(1-ar_c) */
+                ra = sa+da-sa*da;
+                rp[0]=sp[0]*(1.f-da+dp[0])+dp[0]*(1.f-ar);
+                rp[1]=sp[1]*(1.f-da+dp[1])+dp[1]*(1.f-ag);
+                rp[2]=sp[2]*(1.f-da+dp[2])+dp[2]*(1.f-ab); break;
+            case 6: /* SCREEN: r_c=sp+dp*(1-sp) — uses premul sp */
+                ra = sa+da-sa*da;
+                rp[0]=sp[0]+dp[0]*(1.f-sp[0]);
+                rp[1]=sp[1]+dp[1]*(1.f-sp[1]);
+                rp[2]=sp[2]+dp[2]*(1.f-sp[2]); break;
+            case 7: /* DARKEN: min using ar_c on SrcOver term */
+                ra = sa+da-sa*da;
+                rp[0]=fminf(sp[0]+dp[0]*(1.f-ar), dp[0]+sp[0]*(1.f-da));
+                rp[1]=fminf(sp[1]+dp[1]*(1.f-ag), dp[1]+sp[1]*(1.f-da));
+                rp[2]=fminf(sp[2]+dp[2]*(1.f-ab), dp[2]+sp[2]*(1.f-da)); break;
+            case 8: /* LIGHTEN: max using ar_c on SrcOver term */
+                { float a1=sa+da*(1.f-sa), a2=da+sa*(1.f-da); ra=fmaxf(a1,a2); }
+                rp[0]=fmaxf(sp[0]+dp[0]*(1.f-ar), dp[0]+sp[0]*(1.f-da));
+                rp[1]=fmaxf(sp[1]+dp[1]*(1.f-ag), dp[1]+sp[1]*(1.f-da));
+                rp[2]=fmaxf(sp[2]+dp[2]*(1.f-ab), dp[2]+sp[2]*(1.f-da)); break;
             case 9: /* ADDITIVE */
-                out[0]=clampf01(src[0]+d[0]); out[1]=clampf01(src[1]+d[1]);
-                out[2]=clampf01(src[2]+d[2]); out[3]=clampf01(sa+da); break;
+                ra=fminf(sa+da, 1.f);
+                rp[0]=fminf(sp[0]+dp[0],1.f);
+                rp[1]=fminf(sp[1]+dp[1],1.f);
+                rp[2]=fminf(sp[2]+dp[2],1.f); break;
             default:
-                out[0]=src[0]; out[1]=src[1]; out[2]=src[2]; out[3]=sa; break;
+                rp[0]=sp[0]; rp[1]=sp[1]; rp[2]=sp[2]; ra=sa; break;
             }
+            /* De-premultiply for non-premul storage */
+            float out[4];
+            out[3] = clampf01(ra);
+            if (ra > 1e-6f) {
+                out[0] = clampf01(rp[0] / ra);
+                out[1] = clampf01(rp[1] / ra);
+                out[2] = clampf01(rp[2] / ra);
+            } else { out[0]=out[1]=out[2]=0.f; }
 
             /* Write result */
             uint8_t r8 = (uint8_t)(clampf01(out[0]) * 255.f + 0.5f);
@@ -3910,7 +3925,38 @@ static VGUErrorCode vgu_error(VGUErrorCode e) {
 
 static void vgu_append(VGPath path, int ns, const VGubyte *segs, int nc, const VGfloat *c)
 {
-    vgAppendPathData(path, ns, segs, c);
+    /* Convert float coordinates to the path's datatype, matching the RI's VGU append. */
+    cm_path_t *p = (cm_path_t *)(uintptr_t)path;
+    if (!p) { vgAppendPathData(path, ns, segs, c); return; }
+    VGfloat scale = p->scale, bias = p->bias;
+    if (scale == 0.f) scale = 1.f;
+
+    switch (p->datatype) {
+    case VG_PATH_DATATYPE_S_8: {
+        int8_t data[26];
+        for (int i = 0; i < nc && i < 26; i++)
+            data[i] = (int8_t)floorf((c[i] - bias) / scale + 0.5f);
+        vgAppendPathData(path, ns, segs, data);
+        break; }
+    case VG_PATH_DATATYPE_S_16: {
+        int16_t data[26];
+        for (int i = 0; i < nc && i < 26; i++)
+            data[i] = (int16_t)floorf((c[i] - bias) / scale + 0.5f);
+        vgAppendPathData(path, ns, segs, data);
+        break; }
+    case VG_PATH_DATATYPE_S_32: {
+        int32_t data[26];
+        for (int i = 0; i < nc && i < 26; i++)
+            data[i] = (int32_t)floorf((c[i] - bias) / scale + 0.5f);
+        vgAppendPathData(path, ns, segs, data);
+        break; }
+    default: {
+        float data[26];
+        for (int i = 0; i < nc && i < 26; i++)
+            data[i] = (c[i] - bias) / scale;
+        vgAppendPathData(path, ns, segs, data);
+        break; }
+    }
 }
 
 VGUErrorCode vguLine(VGPath path, VGfloat x0, VGfloat y0, VGfloat x1, VGfloat y1)
