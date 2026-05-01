@@ -63,6 +63,9 @@ const uint32_t *vg_cmodel_get_framebuffer(vg_cmodel_t cm,
                                            uint32_t *out_w,
                                            uint32_t *out_h);
 
+/** Return writable pointer to the internal RGBA8888 frame buffer. */
+uint32_t *vg_cmodel_get_fb_rw(vg_cmodel_t cm, uint32_t *out_w, uint32_t *out_h);
+
 /**
  * vg_cmodel_save_ppm – write the current frame buffer to a PPM file.
  * Returns 0 on success.

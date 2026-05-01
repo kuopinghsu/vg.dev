@@ -1315,6 +1315,14 @@ const uint32_t *vg_cmodel_get_framebuffer(vg_cmodel_t cm,
     return cm->fb;
 }
 
+uint32_t *vg_cmodel_get_fb_rw(vg_cmodel_t cm, uint32_t *out_w, uint32_t *out_h)
+{
+    if (!cm) return NULL;
+    if (out_w) *out_w = cm->fb_w;
+    if (out_h) *out_h = cm->fb_h;
+    return cm->fb;
+}
+
 int vg_cmodel_save_ppm(vg_cmodel_t cm, const char *filename)
 {
     if (!cm || !filename) return -1;

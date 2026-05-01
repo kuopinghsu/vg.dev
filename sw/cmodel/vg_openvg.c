@@ -78,6 +78,13 @@ typedef struct cm_paint_s {
 } cm_paint_t;
 
 #define PATH_MAGIC  0xA2B3C4D5u
+#define MASKLAYER_MAGIC 0xD4E5F6A7u
+
+typedef struct cm_masklayer_s {
+    uint32_t magic;
+    int      width, height;
+    uint8_t *data;   /* alpha8, row 0 = top */
+} cm_masklayer_t;
 
 typedef struct cm_path_s {
     uint32_t    magic;        /* PATH_MAGIC for validity checks */
@@ -160,7 +167,8 @@ typedef struct cm_image_s {
     VGint           height;
     VGbitfield      allowed_quality;
     int             bpp;         /* bytes per pixel */
-    uint8_t        *pixels;      /* raw pixel storage: height * width * bpp */
+    uint8_t        *pixels;      /* pointer to start of image data (may be into parent buffer) */
+    int             row_stride;  /* bytes per row in pixels buffer (= width*bpp for root images) */
     VGImage         parent_handle; /* VG_INVALID_HANDLE if root image */
 } cm_image_t;
 
@@ -172,6 +180,7 @@ typedef struct cm_surface_s {
     int          width, height;
     int          is_linear;   /* 0=sRGB  1=linear */
     int          is_premult;  /* 0=non-pre  1=pre */
+    uint8_t     *mask_buf;    /* alpha8 mask buffer, row 0 = top, NULL if not allocated */
 } cm_surface_t;
 
 typedef struct cm_ctx_s {
@@ -237,7 +246,8 @@ static cm_paint_t g_default_stroke_paint;
  * Error helpers
  * ========================================================================= */
 
-#define VG_SET_ERR(e)  do { if (g_ctx) g_ctx->error = (e); } while(0)
+/* Per OpenVG spec: first error since last vgGetError() is preserved; do not override. */
+#define VG_SET_ERR(e)  do { if (g_ctx && g_ctx->error == VG_NO_ERROR) g_ctx->error = (e); } while(0)
 #define EGL_SET_ERR(e) do { g_egl_error = (e); } while(0)
 #define VG_CHECK_CTX(...) do { if (!g_ctx) return __VA_ARGS__; } while(0)
 
@@ -610,6 +620,14 @@ EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config,
 
     surf->cm = vg_cmodel_create((unsigned)w, (unsigned)h);
     if (!surf->cm) { free(surf); EGL_SET_ERR(EGL_BAD_ALLOC); return EGL_NO_SURFACE; }
+    surf->mask_buf = (uint8_t *)malloc((size_t)(w * h));
+    if (!surf->mask_buf) {
+        vg_cmodel_destroy(surf->cm);
+        free(surf);
+        EGL_SET_ERR(EGL_BAD_ALLOC);
+        return EGL_NO_SURFACE;
+    }
+    memset(surf->mask_buf, 0xFF, (size_t)(w * h)); /* initialize mask to fully unmasked */
     surf->width     = w;
     surf->height    = h;
     surf->is_linear = is_linear;
@@ -623,6 +641,7 @@ EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface)
     cm_surface_t *surf = (cm_surface_t *)surface;
     if (!surf) { EGL_SET_ERR(EGL_BAD_SURFACE); return EGL_FALSE; }
     vg_cmodel_destroy(surf->cm);
+    free(surf->mask_buf);
     free(surf);
     if (g_surface == surf) { g_surface = NULL; }
     return EGL_TRUE;
@@ -1131,25 +1150,292 @@ void vgRotate(VGfloat angle)
 }
 
 /* =========================================================================
- * VG — Masking (stubs)
+ * VG — Masking
  * ========================================================================= */
 
+/* Validate a handle as VGImage or VGMaskLayer */
+static int is_image_handle(VGHandle h) {
+    if (h == VG_INVALID_HANDLE) return 0;
+    cm_image_t *img = (cm_image_t *)(uintptr_t)h;
+    return img->magic == IMAGE_MAGIC;
+}
+static int is_masklayer_handle(VGHandle h) {
+    if (h == VG_INVALID_HANDLE) return 0;
+    cm_masklayer_t *ml = (cm_masklayer_t *)(uintptr_t)h;
+    return ml->magic == MASKLAYER_MAGIC;
+}
+
+/* Apply a mask operation to a single mask byte.
+ * cur_val: current mask value (0-255), src_val: source alpha (0-255). */
+static uint8_t apply_mask_op(VGMaskOperation op, uint8_t cur_val, uint8_t src_val) {
+    switch (op) {
+    case VG_CLEAR_MASK:     return 0;
+    case VG_FILL_MASK:      return 255;
+    case VG_SET_MASK:       return src_val;
+    case VG_UNION_MASK:     return (cur_val > src_val) ? cur_val : src_val;
+    case VG_INTERSECT_MASK: return (cur_val < src_val) ? cur_val : src_val;
+    case VG_SUBTRACT_MASK:  {
+        /* mask = mask * (1 - src/255), rounded to nearest */
+        int v = (int)cur_val * (255 - (int)src_val);
+        return (uint8_t)((v + 127) / 255);
+    }
+    default: return cur_val;
+    }
+}
+
 void vgMask(VGHandle mask, VGMaskOperation op, VGint x, VGint y, VGint w, VGint h)
-{ (void)mask;(void)op;(void)x;(void)y;(void)w;(void)h; }
+{
+    VG_CHECK_CTX();
+    /* Validate operation */
+    if (op < VG_CLEAR_MASK || op > VG_SUBTRACT_MASK) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+    }
+    /* VG_SET/UNION/INTERSECT/SUBTRACT need a valid mask handle */
+    if (op != VG_CLEAR_MASK && op != VG_FILL_MASK) {
+        if (!is_image_handle(mask) && !is_masklayer_handle(mask)) {
+            VG_SET_ERR(VG_BAD_HANDLE_ERROR); return;
+        }
+    }
+    /* Width/height must be > 0 */
+    if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+
+    if (!g_surface || !g_surface->mask_buf) return;
+    cm_surface_t *surf = g_surface;
+    int W = surf->width, H = surf->height;
+    uint8_t *mbuf = surf->mask_buf;
+
+    /* Clamp x,y to surface then loop over each mask pixel */
+    int cx  = x < 0 ? 0 : x;
+    int cy  = y < 0 ? 0 : y;
+    int cx2 = x + w; if (cx2 > W) cx2 = W;
+    int cy2 = y + h; if (cy2 > H) cy2 = H;
+    if (cx >= cx2 || cy >= cy2) return;
+
+    /* For CLEAR_MASK / FILL_MASK: no source image needed */
+    if (op == VG_CLEAR_MASK || op == VG_FILL_MASK) {
+        uint8_t fill = (op == VG_FILL_MASK) ? 255 : 0;
+        for (int my = cy; my < cy2; my++) {
+            /* OpenVG y=0 is bottom; mask_buf row 0 is top */
+            int mrow = H - 1 - my;
+            if (mrow < 0 || mrow >= H) continue;
+            memset(mbuf + mrow * W + cx, fill, (size_t)(cx2 - cx));
+        }
+        return;
+    }
+
+    /* Source-based operations: read alpha from image or mask layer */
+    if (is_masklayer_handle(mask)) {
+        cm_masklayer_t *ml = (cm_masklayer_t *)(uintptr_t)mask;
+        /* ml->data: same coordinate system as mask_buf (row 0 = top) */
+        for (int my = cy; my < cy2; my++) {
+            int mrow = H - 1 - my;  /* flip OpenVG y */
+            if (mrow < 0 || mrow >= H) continue;
+            uint8_t *dst = mbuf + mrow * W;
+            int src_y = my - y;  /* offset into mask layer (Y-UP: row 0 = OpenVG y=0) */
+            int ml_row = src_y;  /* no Y-flip: mask layer uses Y-UP like OpenVG */
+            if (ml_row < 0 || ml_row >= ml->height) { /* fill with 0 outside */ continue; }
+            for (int mx = cx; mx < cx2; mx++) {
+                int src_x = mx - x;
+                uint8_t src = (src_x >= 0 && src_x < ml->width) ?
+                              ml->data[ml_row * ml->width + src_x] : 0;
+                dst[mx] = apply_mask_op(op, dst[mx], src);
+            }
+        }
+    } else {
+        /* VGImage: read alpha channel */
+        cm_image_t *img = (cm_image_t *)(uintptr_t)mask;
+        int bpp = img->bpp;
+        for (int my = cy; my < cy2; my++) {
+            int mrow = H - 1 - my;
+            if (mrow < 0 || mrow >= H) continue;
+            uint8_t *dst = mbuf + mrow * W;
+            int src_y = my - y;
+            /* Image y=0 is top in pixel storage */
+            int img_row = src_y;
+            if (img_row < 0 || img_row >= img->height) continue;
+            for (int mx = cx; mx < cx2; mx++) {
+                int src_x = mx - x;
+                uint8_t src = 255;
+                if (src_x >= 0 && src_x < img->width) {
+                    const uint8_t *px = img->pixels + (size_t)img_row * (size_t)img->row_stride + (size_t)src_x * (size_t)bpp;
+                    /* Get alpha for this format: for RGBA/BGRA, alpha is last byte */
+                    if (bpp == 4) src = px[3];
+                    else if (bpp == 1) src = px[0];
+                    else src = 255;
+                }
+                dst[mx] = apply_mask_op(op, dst[mx], src);
+            }
+        }
+    }
+}
+
+/* forward declaration - draw_stroke implementation is in the stroke section */
+static void draw_stroke(cm_ctx_t *ctx, cm_path_t *src_path);
 
 void vgRenderToMask(VGPath path, VGbitfield paintModes, VGMaskOperation op)
-{ (void)path;(void)paintModes;(void)op; }
+{
+    VG_CHECK_CTX();
+    if (path == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_path_t *p = (cm_path_t *)(uintptr_t)path;
+    if (p->magic != PATH_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    if (!(paintModes & (VG_FILL_PATH | VG_STROKE_PATH)) ||
+        (paintModes & ~(uint32_t)(VG_FILL_PATH | VG_STROKE_PATH))) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+    }
+    if (op < VG_CLEAR_MASK || op > VG_SUBTRACT_MASK) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+    }
+    if (!g_surface || !g_surface->mask_buf) return;
+
+    cm_surface_t *surf = g_surface;
+    int W = surf->width, H = surf->height;
+    vg_cmodel_t cm = surf->cm;
+
+    /* Save framebuffer */
+    uint32_t *fb = vg_cmodel_get_fb_rw(cm, NULL, NULL);
+    if (!fb) return;
+    uint32_t *saved = (uint32_t *)malloc((size_t)(W * H) * 4);
+    if (!saved) { VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return; }
+    memcpy(saved, fb, (size_t)(W * H) * 4);
+
+    /* Clear FB to transparent black (no mask) */
+    memset(fb, 0, (size_t)(W * H) * 4);
+
+    /* Save state and override for coverage rendering */
+    VGBlendMode  save_blend   = g_ctx->blend_mode;
+    int          save_masking = g_ctx->masking;
+    cm_paint_t  *save_fill    = g_ctx->fill_paint;
+    cm_paint_t  *save_stroke  = g_ctx->stroke_paint;
+
+    g_ctx->blend_mode   = VG_BLEND_SRC;
+    g_ctx->masking      = 0;
+    /* Use white paint so that alpha = coverage */
+    static cm_paint_t rtm_white_paint;
+    rtm_white_paint.type     = VG_PAINT_TYPE_COLOR;
+    rtm_white_paint.color[0] = 1.f;
+    rtm_white_paint.color[1] = 1.f;
+    rtm_white_paint.color[2] = 1.f;
+    rtm_white_paint.color[3] = 1.f;
+    g_ctx->fill_paint   = &rtm_white_paint;
+    g_ctx->stroke_paint = &rtm_white_paint;
+
+    /* Disable mask in cmodel */
+    vg_cmodel_reg_write(cm, VG_REG_MASK_EN, 0);
+
+    uint32_t blend_hw = (uint32_t)(VG_BLEND_SRC - VG_BLEND_SRC); /* = 0 = SRC */
+    vg_cmodel_reg_write(cm, VG_REG_BLEND_MODE, blend_hw);
+    uint32_t aa_hw = (g_ctx->rendering_quality == VG_RENDERING_QUALITY_NONANTIALIASED)
+                     ? VG_AA_NONE : VG_AA_8X;
+    vg_cmodel_reg_write(cm, VG_REG_AA_SAMPLES, aa_hw);
+    uint32_t fill_rule = (g_ctx->fill_rule == VG_EVEN_ODD)
+                         ? VG_REG_FILL_EVEN_ODD : VG_REG_FILL_NON_ZERO;
+    vg_cmodel_reg_write(cm, VG_REG_FILL_RULE, fill_rule);
+    load_matrix_to_cmodel(g_ctx);
+    load_paint_to_cmodel(g_ctx, &rtm_white_paint);
+    vg_cmodel_reg_write_f(cm, VG_REG_PATH_SCALE, 1.0f);
+    vg_cmodel_reg_write_f(cm, VG_REG_PATH_BIAS,  0.0f);
+
+    if (paintModes & VG_FILL_PATH) {
+        vg_cmodel_set_path_ptr(cm, p->buf, (uint32_t)p->buf_len);
+        vg_cmodel_reg_write(cm, VG_REG_PATH_KICK, 1);
+    }
+    if (paintModes & VG_STROKE_PATH) {
+        draw_stroke(g_ctx, p);
+    }
+
+    /* Apply coverage (alpha channel of fb) to mask_buf using op */
+    uint8_t *mbuf = surf->mask_buf;
+    for (int i = 0; i < W * H; i++) {
+        uint8_t cov = (uint8_t)(fb[i] & 0xFF);  /* alpha in low byte (RGBA pack: r=24, g=16, b=8, a=0) */
+        mbuf[i] = apply_mask_op(op, mbuf[i], cov);
+    }
+
+    /* Restore framebuffer and state */
+    memcpy(fb, saved, (size_t)(W * H) * 4);
+    free(saved);
+    g_ctx->blend_mode   = save_blend;
+    g_ctx->masking      = save_masking;
+    g_ctx->fill_paint   = save_fill;
+    g_ctx->stroke_paint = save_stroke;
+}
 
 VGMaskLayer vgCreateMaskLayer(VGint w, VGint h)
-{ (void)w;(void)h; return VG_INVALID_HANDLE; }
+{
+    VG_CHECK_CTX(VG_INVALID_HANDLE);
+    if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_INVALID_HANDLE; }
+    cm_masklayer_t *ml = (cm_masklayer_t *)malloc(sizeof(cm_masklayer_t));
+    if (!ml) { VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
+    ml->data = (uint8_t *)malloc((size_t)(w * h));
+    if (!ml->data) { free(ml); VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
+    memset(ml->data, 0xFF, (size_t)(w * h)); /* initialized to fully unmasked */
+    ml->magic  = MASKLAYER_MAGIC;
+    ml->width  = w;
+    ml->height = h;
+    return (VGMaskLayer)(uintptr_t)ml;
+}
 
-void vgDestroyMaskLayer(VGMaskLayer ml) { (void)ml; }
+void vgDestroyMaskLayer(VGMaskLayer masklayer)
+{
+    if (masklayer == VG_INVALID_HANDLE) return;
+    cm_masklayer_t *ml = (cm_masklayer_t *)(uintptr_t)masklayer;
+    if (ml->magic != MASKLAYER_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    ml->magic = 0;
+    free(ml->data);
+    free(ml);
+}
 
-void vgFillMaskLayer(VGMaskLayer ml, VGint x, VGint y, VGint w, VGint h, VGfloat v)
-{ (void)ml;(void)x;(void)y;(void)w;(void)h;(void)v; }
+void vgFillMaskLayer(VGMaskLayer masklayer, VGint x, VGint y, VGint w, VGint h, VGfloat value)
+{
+    if (masklayer == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_masklayer_t *ml = (cm_masklayer_t *)(uintptr_t)masklayer;
+    if (ml->magic != MASKLAYER_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    if (value < 0.0f || value > 1.0f) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    /* Clamp to mask layer bounds */
+    int cx  = x < 0 ? 0 : x;
+    int cy  = y < 0 ? 0 : y;
+    int cx2 = x + w; if (cx2 > ml->width)  cx2 = ml->width;
+    int cy2 = y + h; if (cy2 > ml->height) cy2 = ml->height;
+    if (cx >= cx2 || cy >= cy2) return;
+    uint8_t fill = (uint8_t)(value * 255.0f + 0.5f);
+    for (int row = cy; row < cy2; row++) {
+        memset(ml->data + row * ml->width + cx, fill, (size_t)(cx2 - cx));
+    }
+}
 
-void vgCopyMask(VGMaskLayer ml, VGint sx, VGint sy, VGint dx, VGint dy, VGint w, VGint h)
-{ (void)ml;(void)sx;(void)sy;(void)dx;(void)dy;(void)w;(void)h; }
+void vgCopyMask(VGMaskLayer masklayer, VGint sx, VGint sy,
+                VGint dx, VGint dy, VGint width, VGint height)
+{
+    VG_CHECK_CTX();
+    if (masklayer == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_masklayer_t *ml = (cm_masklayer_t *)(uintptr_t)masklayer;
+    if (ml->magic != MASKLAYER_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    if (width <= 0 || height <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    if (!g_surface || !g_surface->mask_buf) return;
+    cm_surface_t *surf = g_surface;
+    int W = surf->width, H = surf->height;
+    uint8_t *mbuf = surf->mask_buf;
+
+    for (int row = 0; row < height; row++) {
+        /* API: vgCopyMask(layer, dx, dy, sx, sy, w, h)
+         * Our params named (sx,sy,dx,dy) actually map to spec's (dx,dy,sx,sy):
+         *   our sx/sy = spec's dx/dy = layer destination
+         *   our dx/dy = spec's sx/sy = surface source
+         * Mask layer uses Y-UP (OpenVG) convention: row 0 = OpenVG y=0 = bottom. */
+        int surf_y = dy + row;  /* surface source y (OpenVG) */
+        int mask_row = H - 1 - surf_y;  /* surface mask_buf index (Y-DOWN) */
+        if (mask_row < 0 || mask_row >= H) continue;
+        int ml_dst_y = sy + row;  /* layer dest y (Y-UP = OpenVG y) */
+        if (ml_dst_y < 0 || ml_dst_y >= ml->height) continue;
+        for (int col = 0; col < width; col++) {
+            int surf_x = dx + col;  /* surface source x */
+            int ml_dst_x = sx + col;  /* layer dest x */
+            if (surf_x < 0 || surf_x >= W) continue;
+            if (ml_dst_x < 0 || ml_dst_x >= ml->width) continue;
+            ml->data[ml_dst_y * ml->width + ml_dst_x] = mbuf[mask_row * W + surf_x];
+        }
+    }
+}
 
 /* =========================================================================
  * VG — Clear
@@ -1489,60 +1775,7 @@ VGboolean vgInterpolatePath(VGPath dst, VGPath st, VGPath en, VGfloat amount)
     return VG_FALSE;
 }
 
-VGfloat vgPathLength(VGPath p, VGint startSeg, VGint numSegs)
-{ (void)p;(void)startSeg;(void)numSegs; VG_SET_ERR(VG_PATH_CAPABILITY_ERROR); return -1.f; }
-
-void vgPointAlongPath(VGPath p, VGint ss, VGint ns, VGfloat d,
-                      VGfloat *x, VGfloat *y, VGfloat *tx, VGfloat *ty)
-{
-    (void)p;(void)ss;(void)ns;(void)d;
-    /* Check for misaligned pointers; spec requires VG_ILLEGAL_ARGUMENT_ERROR */
-    if ((x  && ((uintptr_t)x  & (sizeof(VGfloat)-1u)) != 0) ||
-        (y  && ((uintptr_t)y  & (sizeof(VGfloat)-1u)) != 0) ||
-        (tx && ((uintptr_t)tx & (sizeof(VGfloat)-1u)) != 0) ||
-        (ty && ((uintptr_t)ty & (sizeof(VGfloat)-1u)) != 0)) {
-        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
-    }
-    if (x)*x=0.f; if (y)*y=0.f; if (tx)*tx=0.f; if (ty)*ty=0.f;
-    VG_SET_ERR(VG_PATH_CAPABILITY_ERROR);
-}
-
-void vgPathBounds(VGPath p, VGfloat *minX, VGfloat *minY, VGfloat *w, VGfloat *h)
-{
-    (void)p;
-    if ((minX && ((uintptr_t)minX & (sizeof(VGfloat)-1u)) != 0) ||
-        (minY && ((uintptr_t)minY & (sizeof(VGfloat)-1u)) != 0) ||
-        (w    && ((uintptr_t)w    & (sizeof(VGfloat)-1u)) != 0) ||
-        (h    && ((uintptr_t)h    & (sizeof(VGfloat)-1u)) != 0)) {
-        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
-    }
-    if(minX)*minX=0.f; if(minY)*minY=0.f; if(w)*w=0.f; if(h)*h=0.f;
-    VG_SET_ERR(VG_PATH_CAPABILITY_ERROR);
-}
-
-void vgPathTransformedBounds(VGPath p, VGfloat *minX, VGfloat *minY,
-                              VGfloat *w, VGfloat *h)
-{
-    (void)p;
-    if ((minX && ((uintptr_t)minX & (sizeof(VGfloat)-1u)) != 0) ||
-        (minY && ((uintptr_t)minY & (sizeof(VGfloat)-1u)) != 0) ||
-        (w    && ((uintptr_t)w    & (sizeof(VGfloat)-1u)) != 0) ||
-        (h    && ((uintptr_t)h    & (sizeof(VGfloat)-1u)) != 0)) {
-        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
-    }
-    if(minX)*minX=0.f; if(minY)*minY=0.f; if(w)*w=0.f; if(h)*h=0.f;
-    VG_SET_ERR(VG_PATH_CAPABILITY_ERROR);
-}
-
-/* =========================================================================
- * Software Stroke Renderer
- * =========================================================================
- * Converts the stroke of a path into a fill polygon and submits it to the
- * cmodel fill pipeline.  All geometry is computed in path-user-space; the
- * existing path-user-to-surface matrix is reused unchanged.
- * ========================================================================= */
-
-/* ---- 2-D vector helpers ---- */
+/* ---- 2-D vector helpers (used by both path queries and stroke renderer) ---- */
 typedef struct { float x, y; } sv2;
 #define SV2(xx,yy) ((sv2){(xx),(yy)})
 static sv2 sv2_add(sv2 a, sv2 b){ return SV2(a.x+b.x, a.y+b.y); }
@@ -1569,6 +1802,834 @@ static int ptl_push(ptlist_t *l, sv2 p){
     l->pts[l->n++] = p; return 1;
 }
 static void ptl_free(ptlist_t *l){ free(l->pts); l->pts=NULL; l->n=l->cap=0; }
+
+/* forward declaration - flat_arc implementation is in the stroke section below */
+static void flat_arc(ptlist_t *l, sv2 p0, float rx, float ry,
+                     float phi_deg, sv2 p1, int large, int ccw);
+
+/* =========================================================================
+ * RI-compatible arc tessellation for path queries (vgPathLength, etc.)
+ * Replicates the RI's circularLerp / unitAverage / findEllipses algorithm
+ * using RI_NUM_TESSELLATED_SEGMENTS=256, matching the RI's exact FP behavior.
+ * ========================================================================= */
+
+/* 3x3 matrix for RI arc computation (row-major, only upper 2x3 used) */
+typedef struct { float m[3][3]; } ri_m3_t;
+
+static float ri_v2_dot(sv2 a, sv2 b) { return a.x*b.x + a.y*b.y; }
+static sv2 ri_v2_perp_ccw(sv2 v)   { return SV2(-v.y,  v.x); }
+static sv2 ri_v2_perp_cw(sv2 v)    { return SV2( v.y, -v.x); }
+static sv2 ri_v2_half(sv2 a, sv2 b){ return SV2(0.5f*(a.x+b.x), 0.5f*(a.y+b.y)); }
+static sv2 ri_v2_neg(sv2 v)         { return SV2(-v.x, -v.y); }
+static int  ri_v2_eq(sv2 a, sv2 b)  { return a.x==b.x && a.y==b.y; }
+
+/* RI normalize: uses double precision internally (riMath.h) */
+static sv2 ri_v2_normalize(sv2 v) {
+    double x = v.x, y = v.y, l = x*x + y*y;
+    if (l != 0.0) l = 1.0 / sqrt(l);
+    return SV2((float)(x*l), (float)(y*l));
+}
+
+/* unitAverage with cw flag (RI's 3-param version) */
+static sv2 ri_unit_avg_cw(sv2 u0, sv2 u1, int cw) {
+    sv2 u = ri_v2_half(u0, u1);
+    sv2 n0 = ri_v2_perp_ccw(u0);
+    if (ri_v2_dot(u, u) > 0.25f) {
+        if (ri_v2_dot(n0, u1) < 0.0f) u = ri_v2_neg(u);
+    } else {
+        sv2 n1 = ri_v2_perp_cw(u1);
+        u = ri_v2_half(n0, n1);
+    }
+    if (cw) u = ri_v2_neg(u);
+    return ri_v2_normalize(u);
+}
+
+/* circularLerp with cw flag (RI's 4-param version) - used for arc tessellation */
+static sv2 ri_circ_lerp_cw(sv2 t0, sv2 t1, float ratio, int cw) {
+    sv2 u0 = t0, u1 = t1;
+    float l0 = 0.0f, l1 = 1.0f;
+    for (int i = 0; i < 18; i++) {
+        sv2 n = ri_unit_avg_cw(u0, u1, cw);
+        float l = 0.5f * (l0 + l1);
+        if (ratio < l) { u1 = n; l1 = l; }
+        else           { u0 = n; l0 = l; }
+    }
+    return u0;
+}
+
+/* Affine 2x3 transform: v' = M * v + t */
+static sv2 ri_affine(const ri_m3_t *m, sv2 v) {
+    return SV2(v.x*m->m[0][0] + v.y*m->m[0][1] + m->m[0][2],
+               v.x*m->m[1][0] + v.y*m->m[1][1] + m->m[1][2]);
+}
+
+/*
+ * ri_arc_tess: RI-compatible arc tessellation.
+ * Exactly replicates RI's addArcTo / findEllipses with 256 steps.
+ * Adds 255 interior arc points + the endpoint p1 to *l.
+ * p0 is already in *l.  large/ccw flags match the VG segment type.
+ */
+static void ri_arc_tess(ptlist_t *l, sv2 p0, float rh, float rv, float phi_deg,
+                        sv2 p1, int large, int ccw)
+{
+    /* Segment type → center choice and direction:
+     * large=0,ccw=1 (SCCWARC): cp=c0, cw=false
+     * large=0,ccw=0 (SCWARC):  cp=c1, cw=true
+     * large=1,ccw=1 (LCCWARC): cp=c1, cw=false
+     * large=1,ccw=0 (LCWARC):  cp=c0, cw=true
+     * use_c1 = (large == ccw), cw_dir = !ccw */
+    int use_c1  = (large == ccw);   /* 0-indexed booleans */
+    int cw_dir  = !ccw;
+
+    rh = fabsf(rh); rv = fabsf(rv);
+    if (rh < 1e-7f || rv < 1e-7f) { ptl_push(l, p1); return; }
+
+    sv2 p1r = SV2(p1.x - p0.x, p1.y - p0.y);   /* relative endpoint */
+    if (ri_v2_eq(p1r, SV2(0.0f, 0.0f))) return;
+
+    float rot = phi_deg * (float)(M_PI / 180.0);
+    float crot = cosf(rot), srot = sinf(rot);
+
+    /* unitCircleToEllipse (no translation yet) */
+    ri_m3_t uce;
+    memset(&uce, 0, sizeof(uce));
+    uce.m[0][0] = crot*rh;  uce.m[0][1] = -srot*rv;
+    uce.m[1][0] = srot*rh;  uce.m[1][1] =  crot*rv;
+    uce.m[2][2] = 1.0f;
+
+    /* ellipseToUnitCircle = invert(uce) (no translation in uce, so det = rh*rv) */
+    float det = uce.m[0][0]*uce.m[1][1] - uce.m[0][1]*uce.m[1][0];
+    if (fabsf(det) < 1e-20f) { ptl_push(l, p1); return; }
+    float idet = 1.0f / det;
+    ri_m3_t euc;
+    memset(&euc, 0, sizeof(euc));
+    euc.m[0][0] =  uce.m[1][1] * idet;
+    euc.m[0][1] = -uce.m[0][1] * idet;
+    euc.m[1][0] = -uce.m[1][0] * idet;
+    euc.m[1][1] =  uce.m[0][0] * idet;
+    euc.m[2][2] = 1.0f;  /* no translation; euc.m[0][2]=euc.m[1][2]=0 */
+
+    /* RI passes p0=(0,0) and p1=p1r to findEllipses */
+    sv2 u0 = SV2(0.0f, 0.0f);          /* affine(euc, (0,0)) = (0,0) */
+    sv2 u1 = ri_affine(&euc, p1r);      /* p1r in unit circle space  */
+
+    sv2 mv = ri_v2_half(u0, u1);
+    sv2 d  = SV2(u0.x - u1.x, u0.y - u1.y);
+    float lsq = ri_v2_dot(d, d);
+    if (lsq <= 0.0f) { ptl_push(l, p1); return; }
+
+    float disc = 1.0f / lsq - 0.25f;
+    if (disc < 0.0f) {
+        /* Axes too small: scale so a solution exists (RI's rescaling branch) */
+        float scale = 0.5f * sqrtf(lsq);
+        rh *= scale; rv *= scale;
+        uce.m[0][0] = crot*rh;  uce.m[0][1] = -srot*rv;
+        uce.m[1][0] = srot*rh;  uce.m[1][1] =  crot*rv;
+        det = uce.m[0][0]*uce.m[1][1] - uce.m[0][1]*uce.m[1][0];
+        if (fabsf(det) < 1e-20f) { ptl_push(l, p1); return; }
+        idet = 1.0f / det;
+        euc.m[0][0] =  uce.m[1][1] * idet;
+        euc.m[0][1] = -uce.m[0][1] * idet;
+        euc.m[1][0] = -uce.m[1][0] * idet;
+        euc.m[1][1] =  uce.m[0][0] * idet;
+        u1 = ri_affine(&euc, p1r);
+        d  = SV2(u0.x - u1.x, u0.y - u1.y);
+        mv = ri_v2_half(u0, u1);
+        lsq = ri_v2_dot(d, d);
+        if (lsq <= 0.0f) { ptl_push(l, p1); return; }
+        disc = 1.0f / lsq - 0.25f;
+        if (disc < 0.0f) disc = 0.0f;
+    }
+    if (ri_v2_eq(u0, u1)) { ptl_push(l, p1); return; }
+
+    /* Find the two candidate centers */
+    float sdist = sqrtf(disc);
+    sv2 sd = SV2(d.x * sdist, d.y * sdist);
+    sv2 sp = ri_v2_perp_cw(sd);          /* perpCW of sd */
+    sv2 c0 = SV2(mv.x + sp.x, mv.y + sp.y);
+    sv2 c1 = SV2(mv.x - sp.x, mv.y - sp.y);
+
+    sv2 center = use_c1 ? c1 : c0;
+
+    /* Unit circle vectors relative to center */
+    sv2 ua = SV2(u0.x - center.x, u0.y - center.y);
+    sv2 ub = SV2(u1.x - center.x, u1.y - center.y);
+
+    if (ri_v2_eq(ua, ub) ||
+        (ua.x==0.0f && ua.y==0.0f) ||
+        (ub.x==0.0f && ub.y==0.0f)) { ptl_push(l, p1); return; }
+
+    /* Bake center translation into uce: center in ellipse/world coords */
+    sv2 center_e = ri_affine(&uce, center);  /* uce still has no translation */
+    uce.m[0][2] = center_e.x;
+    uce.m[1][2] = center_e.y;
+
+    /* Tessellate with RI_NUM_TESSELLATED_SEGMENTS=256 using circularLerp */
+    const int SEG = 256;
+    for (int i = 1; i < SEG; i++) {
+        float t  = (float)i / (float)SEG;
+        sv2   pn = ri_circ_lerp_cw(ua, ub, t, cw_dir);
+        /* Map unit-circle point → world: affine(uce, pn) + p0 */
+        sv2   pw = ri_affine(&uce, pn);
+        ptl_push(l, SV2(pw.x + p0.x, pw.y + p0.y));
+    }
+    ptl_push(l, p1);   /* final endpoint */
+}
+
+/* RI arc tangent: perpendicular(pn, cw) mapped through the 2x2 part of uce, normalized.
+ * Matches RI's: tn = normalize(affineTangentTransform(uce, perpendicular(pn, cw)))
+ * where perpendicular(v, cw=true) = (v.y, -v.x), perpendicular(v, cw=false) = (-v.y, v.x). */
+static sv2 ri_arc_tan(sv2 pn, int cw_dir, const ri_m3_t *uce) {
+    sv2 tn = cw_dir ? SV2(pn.y, -pn.x) : SV2(-pn.y, pn.x);
+    /* 2x2 affine tangent transform (no translation) */
+    sv2 tm = SV2(tn.x*uce->m[0][0] + tn.y*uce->m[0][1],
+                 tn.x*uce->m[1][0] + tn.y*uce->m[1][1]);
+    return ri_v2_normalize(tm);
+}
+
+/* Arc geometry context from findEllipses.  A is valid flag (0 if degenerate arc). */
+typedef struct {
+    sv2      ua, ub;    /* unit circle start/end vectors (relative to center) */
+    ri_m3_t  uce;       /* unitCircleToEllipse (with center baked into translation) */
+    int      cw;        /* clockwise flag */
+    int      valid;     /* 1 if ellipses found, 0 if degenerate */
+} ri_arc_ctx_t;
+
+/*
+ * ri_arc_setup: run findEllipses for the arc from p0 to p1.
+ * Returns ctx.valid=1 on success, 0 if arc is degenerate (fall back to line).
+ */
+static ri_arc_ctx_t ri_arc_setup(sv2 p0, float rh, float rv, float phi_deg,
+                                  sv2 p1, int large, int ccw)
+{
+    ri_arc_ctx_t ctx; memset(&ctx, 0, sizeof(ctx));
+    int use_c1 = (large == ccw);
+    ctx.cw = !ccw;
+
+    rh = fabsf(rh); rv = fabsf(rv);
+    if (rh < 1e-7f || rv < 1e-7f) return ctx;
+
+    sv2 p1r = SV2(p1.x - p0.x, p1.y - p0.y);
+    if (ri_v2_eq(p1r, SV2(0.0f, 0.0f))) return ctx;
+
+    float rot = phi_deg * (float)(M_PI / 180.0);
+    float crot = cosf(rot), srot = sinf(rot);
+
+    ri_m3_t uce; memset(&uce, 0, sizeof(uce));
+    uce.m[0][0] = crot*rh; uce.m[0][1] = -srot*rv;
+    uce.m[1][0] = srot*rh; uce.m[1][1] =  crot*rv;
+    uce.m[2][2] = 1.0f;
+
+    float det = uce.m[0][0]*uce.m[1][1] - uce.m[0][1]*uce.m[1][0];
+    if (fabsf(det) < 1e-20f) return ctx;
+    float idet = 1.0f / det;
+    ri_m3_t euc; memset(&euc, 0, sizeof(euc));
+    euc.m[0][0] =  uce.m[1][1]*idet; euc.m[0][1] = -uce.m[0][1]*idet;
+    euc.m[1][0] = -uce.m[1][0]*idet; euc.m[1][1] =  uce.m[0][0]*idet;
+    euc.m[2][2] = 1.0f;
+
+    sv2 u0 = SV2(0.0f, 0.0f), u1 = ri_affine(&euc, p1r);
+    sv2 mv = ri_v2_half(u0, u1);
+    sv2 d  = SV2(u0.x - u1.x, u0.y - u1.y);
+    float lsq = ri_v2_dot(d, d);
+    if (lsq <= 0.0f) return ctx;
+
+    float disc = 1.0f / lsq - 0.25f;
+    if (disc < 0.0f) {
+        float scale = 0.5f * sqrtf(lsq);
+        rh *= scale; rv *= scale;
+        uce.m[0][0] = crot*rh; uce.m[0][1] = -srot*rv;
+        uce.m[1][0] = srot*rh; uce.m[1][1] =  crot*rv;
+        det = uce.m[0][0]*uce.m[1][1] - uce.m[0][1]*uce.m[1][0];
+        if (fabsf(det) < 1e-20f) return ctx;
+        idet = 1.0f / det;
+        euc.m[0][0] =  uce.m[1][1]*idet; euc.m[0][1] = -uce.m[0][1]*idet;
+        euc.m[1][0] = -uce.m[1][0]*idet; euc.m[1][1] =  uce.m[0][0]*idet;
+        u1 = ri_affine(&euc, p1r);
+        d  = SV2(u0.x - u1.x, u0.y - u1.y);
+        mv = ri_v2_half(u0, u1);
+        lsq = ri_v2_dot(d, d);
+        if (lsq <= 0.0f) return ctx;
+        disc = 1.0f / lsq - 0.25f;
+        if (disc < 0.0f) disc = 0.0f;
+    }
+    if (ri_v2_eq(u0, u1)) return ctx;
+
+    float sdist = sqrtf(disc);
+    sv2 sd = SV2(d.x*sdist, d.y*sdist);
+    sv2 sp = ri_v2_perp_cw(sd);
+    sv2 c0 = SV2(mv.x+sp.x, mv.y+sp.y);
+    sv2 c1 = SV2(mv.x-sp.x, mv.y-sp.y);
+    sv2 center = use_c1 ? c1 : c0;
+
+    sv2 ua = SV2(u0.x-center.x, u0.y-center.y);
+    sv2 ub = SV2(u1.x-center.x, u1.y-center.y);
+    if (ri_v2_eq(ua, ub) || (ua.x==0&&ua.y==0) || (ub.x==0&&ub.y==0)) return ctx;
+
+    sv2 center_e = ri_affine(&uce, center);
+    uce.m[0][2] = center_e.x; uce.m[1][2] = center_e.y;
+
+    ctx.ua = ua; ctx.ub = ub; ctx.uce = uce; ctx.valid = 1;
+    return ctx;
+}
+
+/* Compute arc position at unit-circle point pn: world = affine(uce, pn) + p0 */
+static sv2 ri_arc_pos(const ri_arc_ctx_t *ctx, sv2 pn, sv2 p0) {
+    sv2 raw = ri_affine(&ctx->uce, pn);
+    return SV2(raw.x + p0.x, raw.y + p0.y);
+}
+
+/* =========================================================================
+ * Path geometry utilities (vgPathLength, vgPathBounds, vgPointAlongPath)
+ * =========================================================================
+ * Uses 256-segment uniform tessellation for Bezier curves, matching the
+ * OpenVG RI's RI_NUM_TESSELLATED_SEGMENTS = 256, with double-precision
+ * distance accumulation (Vector2::length uses sqrt((double)x*x+(double)y*y)).
+ * ========================================================================= */
+
+/* RI-compatible distance: double-precision internally */
+static float pw_dist(float dx, float dy) {
+    return (float)sqrt((double)dx*(double)dx + (double)dy*(double)dy);
+}
+
+#define PW_TESS_N  256   /* RI_NUM_TESSELLATED_SEGMENTS */
+
+/* Tessellated vertex for path queries */
+typedef struct {
+    float x, y;        /* position */
+    float tx, ty;      /* unit tangent */
+    float path_len;    /* cumulative path length at this vertex */
+    int   seg_idx;     /* source segment index */
+} pw_vtx_t;
+
+typedef struct { pw_vtx_t *v; int n, cap; } pw_vl_t;
+
+static void pw_vl_push(pw_vl_t *l, pw_vtx_t pv) {
+    if (l->n >= l->cap) {
+        int nc = l->cap ? l->cap * 2 : 512;
+        pw_vtx_t *nb = (pw_vtx_t *)realloc(l->v, (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        l->v = nb; l->cap = nc;
+    }
+    l->v[l->n++] = pv;
+}
+static void pw_vl_free(pw_vl_t *l) { free(l->v); l->v = NULL; l->n = l->cap = 0; }
+
+/* Apply affine matrix M[9] (column-major OpenVG layout) to point (px,py) -> (ox,oy) */
+static void mat_xform_pt(const float M[9], float px, float py, float *ox, float *oy) {
+    *ox = M[0]*px + M[3]*py + M[6];
+    *oy = M[1]*px + M[4]*py + M[7];
+}
+
+/* Update bounding box for a single point, optionally transformed */
+static void pw_bbox_pt(float *bx0, float *by0, float *bx1, float *by1,
+                        const float *xf, float px, float py)
+{
+    float x = px, y = py;
+    if (xf) mat_xform_pt(xf, px, py, &x, &y);
+    if (x < *bx0) *bx0 = x; if (x > *bx1) *bx1 = x;
+    if (y < *by0) *by0 = y; if (y > *by1) *by1 = y;
+}
+
+/* Add edge p0->p1 with tangents to vl and update bbox for ACTUAL curve points.
+ * is_first_edge=1 also adds/tracks the start point p0.
+ * bx0..by1 and xf may be NULL to skip bbox updates. */
+static float pw_add_edge(pw_vl_t *vl, int seg_idx,
+                          float x0, float y0, float t0x, float t0y,
+                          float x1, float y1, float t1x, float t1y,
+                          float globalLen, int is_first_edge,
+                          float *bx0, float *by0, float *bx1, float *by1,
+                          const float *xf)
+{
+    if (vl && is_first_edge) {
+        pw_vtx_t pv = {x0, y0, t0x, t0y, globalLen, seg_idx};
+        pw_vl_push(vl, pv);
+    }
+    if (bx0 && is_first_edge) pw_bbox_pt(bx0, by0, bx1, by1, xf, x0, y0);
+    float l = pw_dist(x1 - x0, y1 - y0);
+    globalLen += l;
+    if (vl) {
+        pw_vtx_t pv = {x1, y1, t1x, t1y, globalLen, seg_idx};
+        pw_vl_push(vl, pv);
+    }
+    if (bx0) pw_bbox_pt(bx0, by0, bx1, by1, xf, x1, y1);
+    return globalLen;
+}
+
+/* Tessellate quadratic bezier p0->p2 with control p1 (256 uniform samples). */
+static float pw_tess_quad(pw_vl_t *vl, int seg_idx,
+                           float p0x, float p0y, float p1x, float p1y,
+                           float p2x, float p2y, float globalLen,
+                           float *bx0, float *by0, float *bx1, float *by1,
+                           const float *xf)
+{
+    /* Incoming tangent at t=0: direction of first control segment, like the RI */
+    float inc_tx = p1x - p0x, inc_ty = p1y - p0y;
+    float inc_l = pw_dist(inc_tx, inc_ty);
+    if (inc_l > 1e-10f) { inc_tx /= inc_l; inc_ty /= inc_l; }
+    else { inc_tx = 1.0f; inc_ty = 0.0f; }
+
+    float ppx = p0x, ppy = p0y;
+    int ife = 1;
+    for (int i = 1; i < PW_TESS_N; i++) {
+        float t = (float)i / (float)PW_TESS_N, u = 1.0f - t;
+        float pnx = u*u*p0x + 2.0f*t*u*p1x + t*t*p2x;
+        float pny = u*u*p0y + 2.0f*t*u*p1y + t*t*p2y;
+        float tnx = (p1x-p0x)*u + (p2x-p1x)*t;
+        float tny = (p1y-p0y)*u + (p2y-p1y)*t;
+        float tl = pw_dist(tnx, tny);
+        if (tl > 1e-10f) { tnx /= tl; tny /= tl; } else { tnx = 1.0f; tny = 0.0f; }
+        globalLen = pw_add_edge(vl, seg_idx, ppx, ppy, ife ? inc_tx : tnx, ife ? inc_ty : tny, pnx, pny, tnx, tny,
+                                 globalLen, ife, bx0, by0, bx1, by1, xf);
+        ppx = pnx; ppy = pny; ife = 0;
+    }
+    float t2x = p2x - p1x, t2y = p2y - p1y;
+    float t2l = pw_dist(t2x, t2y);
+    if (t2l > 1e-10f) { t2x /= t2l; t2y /= t2l; } else { t2x = 1.0f; t2y = 0.0f; }
+    return pw_add_edge(vl, seg_idx, ppx, ppy, ife ? inc_tx : t2x, ife ? inc_ty : t2y, p2x, p2y, t2x, t2y,
+                        globalLen, ife, bx0, by0, bx1, by1, xf);
+}
+
+/* Tessellate cubic bezier p0->p3 with controls p1, p2 (256 uniform samples). */
+static float pw_tess_cubic(pw_vl_t *vl, int seg_idx,
+                            float p0x, float p0y, float p1x, float p1y,
+                            float p2x, float p2y, float p3x, float p3y,
+                            float globalLen,
+                            float *bx0, float *by0, float *bx1, float *by1,
+                            const float *xf)
+{
+    /* Incoming tangent at t=0: like the RI */
+    float inc_tx = p1x - p0x, inc_ty = p1y - p0y;
+    if (fabsf(inc_tx) < 1e-10f && fabsf(inc_ty) < 1e-10f) {
+        inc_tx = p2x - p0x; inc_ty = p2y - p0y;
+        if (fabsf(inc_tx) < 1e-10f && fabsf(inc_ty) < 1e-10f) { inc_tx = p3x - p0x; inc_ty = p3y - p0y; }
+    }
+    float inc_l = pw_dist(inc_tx, inc_ty);
+    if (inc_l > 1e-10f) { inc_tx /= inc_l; inc_ty /= inc_l; } else { inc_tx = 1.0f; inc_ty = 0.0f; }
+
+    float ppx = p0x, ppy = p0y;
+    int ife = 1;
+    for (int i = 1; i < PW_TESS_N; i++) {
+        float t = (float)i / (float)PW_TESS_N;
+        /* Use RI's expanded polynomial form for bit-exact match */
+        float pnx = (1.0f-3.0f*t+3.0f*t*t-t*t*t)*p0x + (3.0f*t-6.0f*t*t+3.0f*t*t*t)*p1x + (3.0f*t*t-3.0f*t*t*t)*p2x + t*t*t*p3x;
+        float pny = (1.0f-3.0f*t+3.0f*t*t-t*t*t)*p0y + (3.0f*t-6.0f*t*t+3.0f*t*t*t)*p1y + (3.0f*t*t-3.0f*t*t*t)*p2y + t*t*t*p3y;
+        float tnx = (-3.0f+6.0f*t-3.0f*t*t)*p0x + (3.0f-12.0f*t+9.0f*t*t)*p1x + (6.0f*t-9.0f*t*t)*p2x + 3.0f*t*t*p3x;
+        float tny = (-3.0f+6.0f*t-3.0f*t*t)*p0y + (3.0f-12.0f*t+9.0f*t*t)*p1y + (6.0f*t-9.0f*t*t)*p2y + 3.0f*t*t*p3y;
+        float tl = pw_dist(tnx, tny);
+        if (tl > 1e-10f) { tnx /= tl; tny /= tl; } else { tnx = 1.0f; tny = 0.0f; }
+        globalLen = pw_add_edge(vl, seg_idx, ppx, ppy, ife ? inc_tx : tnx, ife ? inc_ty : tny, pnx, pny, tnx, tny,
+                                 globalLen, ife, bx0, by0, bx1, by1, xf);
+        ppx = pnx; ppy = pny; ife = 0;
+    }
+    /* Outgoing tangent at t=1: like the RI */
+    float out_tx = p3x - p2x, out_ty = p3y - p2y;
+    if (fabsf(out_tx) < 1e-10f && fabsf(out_ty) < 1e-10f) {
+        out_tx = p3x - p1x; out_ty = p3y - p1y;
+        if (fabsf(out_tx) < 1e-10f && fabsf(out_ty) < 1e-10f) { out_tx = p3x - p0x; out_ty = p3y - p0y; }
+    }
+    float out_l = pw_dist(out_tx, out_ty);
+    if (out_l > 1e-10f) { out_tx /= out_l; out_ty /= out_l; } else { out_tx = 1.0f; out_ty = 0.0f; }
+    return pw_add_edge(vl, seg_idx, ppx, ppy, ife ? inc_tx : out_tx, ife ? inc_ty : out_ty, p3x, p3y, out_tx, out_ty,
+                        globalLen, ife, bx0, by0, bx1, by1, xf);
+}
+
+/* Walk path segments [0 .. end_seg_excl), accumulating:
+ *  - seg_start_len[i] / seg_end_len[i]: path length at start/end of segment i
+ *  - vl: optional list of tessellated vertices
+ *  - bbox: optional bounding box (bx0,by0,bx1,by1) of TRANSFORMED vertices
+ *    when xform != NULL, each vertex is transformed before updating bbox.
+ * Returns globalLen after walking. */
+static float pw_walk(const cm_path_t *path, int end_seg_excl,
+                     float *seg_start_len, float *seg_end_len,
+                     pw_vl_t *vl,
+                     float *bx0, float *by0, float *bx1, float *by1,
+                     const float xform[9])
+{
+    if (!path || path->buf_len <= 0 || end_seg_excl <= 0) return 0.0f;
+    const uint8_t *rp  = path->buf;
+    const uint8_t *end = path->buf + path->buf_len;
+    float ox = 0, oy = 0;   /* current position */
+    float sx = 0, sy = 0;   /* subpath start */
+    float pcx = 0, pcy = 0; /* last smooth control point */
+    int prev_quad = 0, prev_cubic = 0;
+    int seg_idx = 0;
+    float globalLen = 0.0f;
+
+#define PW_BBOX(px_, py_) do { \
+    if (bx0) pw_bbox_pt(bx0, by0, bx1, by1, xform, (px_), (py_)); \
+    } while(0)
+
+    while (rp < end && seg_idx < end_seg_excl) {
+        uint32_t hdr; memcpy(&hdr, rp, 4); rp += 4;
+        uint8_t seg = (uint8_t)(hdr & 0xFF);
+        uint8_t cmd = seg & ~1u;
+        int nc = seg_coord_count(seg);
+        float c[6] = {0,0,0,0,0,0};
+        for (int i = 0; i < nc; i++) { memcpy(&c[i], rp, 4); rp += 4; }
+        int r = (seg & 1) != 0; /* is REL? */
+        if (seg_start_len) seg_start_len[seg_idx] = globalLen;
+
+        switch (cmd) {
+        case VG_CLOSE_PATH: {
+            float dx = sx-ox, dy = sy-oy;
+            float l = pw_dist(dx, dy);
+            if (l > 0.0f) {
+                float tnx = dx/l, tny = dy/l;
+                globalLen = pw_add_edge(vl, seg_idx, ox, oy, tnx, tny, sx, sy, tnx, tny,
+                                         globalLen, 1, bx0, by0, bx1, by1, xform);
+            } else { PW_BBOX(sx, sy); }
+            ox = sx; oy = sy; pcx = sx; pcy = sy;
+            prev_quad = prev_cubic = 0; break; }
+        case VG_MOVE_TO: {
+            float x = r ? ox+c[0] : c[0], y = r ? oy+c[1] : c[1];
+            PW_BBOX(x, y);
+            ox = sx = x; oy = sy = y; pcx = x; pcy = y;
+            prev_quad = prev_cubic = 0; break; }
+        case VG_LINE_TO: {
+            float x = r ? ox+c[0] : c[0], y = r ? oy+c[1] : c[1];
+            float l = pw_dist(x-ox, y-oy);
+            float tnx = (l>1e-10f)?(x-ox)/l:1.0f, tny = (l>1e-10f)?(y-oy)/l:0.0f;
+            globalLen = pw_add_edge(vl, seg_idx, ox, oy, tnx, tny, x, y, tnx, tny,
+                                     globalLen, 1, bx0, by0, bx1, by1, xform);
+            ox = x; oy = y; pcx = x; pcy = y; prev_quad = prev_cubic = 0; break; }
+        case VG_HLINE_TO: {
+            float x = r ? ox+c[0] : c[0], y = oy;
+            float tnx = (x >= ox) ? 1.0f : -1.0f;
+            globalLen = pw_add_edge(vl, seg_idx, ox, oy, tnx, 0.0f, x, y, tnx, 0.0f,
+                                     globalLen, 1, bx0, by0, bx1, by1, xform);
+            ox = x; oy = y; pcx = x; pcy = y; prev_quad = prev_cubic = 0; break; }
+        case VG_VLINE_TO: {
+            float x = ox, y = r ? oy+c[0] : c[0];
+            float tny = (y >= oy) ? 1.0f : -1.0f;
+            globalLen = pw_add_edge(vl, seg_idx, ox, oy, 0.0f, tny, x, y, 0.0f, tny,
+                                     globalLen, 1, bx0, by0, bx1, by1, xform);
+            ox = x; oy = y; pcx = x; pcy = y; prev_quad = prev_cubic = 0; break; }
+        case VG_QUAD_TO: {
+            float cx = r?ox+c[0]:c[0], cy = r?oy+c[1]:c[1];
+            float x  = r?ox+c[2]:c[2], y  = r?oy+c[3]:c[3];
+            globalLen = pw_tess_quad(vl, seg_idx, ox, oy, cx, cy, x, y, globalLen,
+                                      bx0, by0, bx1, by1, xform);
+            pcx = cx; pcy = cy; ox = x; oy = y; prev_quad = 1; prev_cubic = 0; break; }
+        case VG_SQUAD_TO: {
+            float cx = prev_quad ? 2.0f*ox-pcx : ox;
+            float cy = prev_quad ? 2.0f*oy-pcy : oy;
+            float x  = r?ox+c[0]:c[0], y = r?oy+c[1]:c[1];
+            globalLen = pw_tess_quad(vl, seg_idx, ox, oy, cx, cy, x, y, globalLen,
+                                      bx0, by0, bx1, by1, xform);
+            pcx = cx; pcy = cy; ox = x; oy = y; prev_quad = 1; prev_cubic = 0; break; }
+        case VG_CUBIC_TO: {
+            float c1x=r?ox+c[0]:c[0], c1y=r?oy+c[1]:c[1];
+            float c2x=r?ox+c[2]:c[2], c2y=r?oy+c[3]:c[3];
+            float x  =r?ox+c[4]:c[4], y  =r?oy+c[5]:c[5];
+            globalLen = pw_tess_cubic(vl, seg_idx, ox, oy, c1x, c1y, c2x, c2y, x, y,
+                                       globalLen, bx0, by0, bx1, by1, xform);
+            pcx = c2x; pcy = c2y; ox = x; oy = y; prev_quad = 0; prev_cubic = 1; break; }
+        case VG_SCUBIC_TO: {
+            float c1x = prev_cubic ? 2.0f*ox-pcx : ox;
+            float c1y = prev_cubic ? 2.0f*oy-pcy : oy;
+            float c2x=r?ox+c[0]:c[0], c2y=r?oy+c[1]:c[1];
+            float x  =r?ox+c[2]:c[2], y  =r?oy+c[3]:c[3];
+            globalLen = pw_tess_cubic(vl, seg_idx, ox, oy, c1x, c1y, c2x, c2y, x, y,
+                                       globalLen, bx0, by0, bx1, by1, xform);
+            pcx = c2x; pcy = c2y; ox = x; oy = y; prev_quad = 0; prev_cubic = 1; break; }
+        case VG_SCCWARC_TO: case VG_SCWARC_TO:
+        case VG_LCCWARC_TO: case VG_LCWARC_TO: {
+            float rx = fabsf(c[0]), ry = fabsf(c[1]), phi = c[2];
+            float x  = r ? ox+c[3] : c[3], y = r ? oy+c[4] : c[4];
+            int large = (cmd == VG_LCCWARC_TO || cmd == VG_LCWARC_TO);
+            int ccw   = (cmd == VG_SCCWARC_TO || cmd == VG_LCCWARC_TO);
+            sv2 arc_p0 = SV2(ox, oy), arc_p1 = SV2(x, y);
+            ri_arc_ctx_t actx = ri_arc_setup(arc_p0, rx, ry, phi, arc_p1, large, ccw);
+            if (!actx.valid) {
+                /* Degenerate: add line to endpoint */
+                float dx = x-ox, dy = y-oy, l = pw_dist(dx, dy);
+                float tnx = (l>1e-10f)?dx/l:1.0f, tny = (l>1e-10f)?dy/l:0.0f;
+                globalLen = pw_add_edge(vl, seg_idx, ox, oy, tnx, tny, x, y, tnx, tny,
+                                         globalLen, 1, bx0, by0, bx1, by1, xform);
+            } else {
+                /* RI-compatible arc edges with proper arc tangents */
+                const int SEG = 256;
+                sv2 pp = arc_p0;
+                sv2 tp = ri_arc_tan(actx.ua, actx.cw, &actx.uce);
+                int ife = 1;
+                for (int i = 1; i <= SEG; i++) {
+                    sv2 pn_unit, pw;
+                    if (i < SEG) {
+                        pn_unit = ri_circ_lerp_cw(actx.ua, actx.ub,
+                                                   (float)i / (float)SEG, actx.cw);
+                        pw = ri_arc_pos(&actx, pn_unit, arc_p0);
+                    } else {
+                        pn_unit = actx.ub;
+                        pw = arc_p1;   /* exact endpoint, no floating-point drift */
+                    }
+                    sv2 tn = ri_arc_tan(pn_unit, actx.cw, &actx.uce);
+                    globalLen = pw_add_edge(vl, seg_idx,
+                                             pp.x, pp.y, tp.x, tp.y,
+                                             pw.x, pw.y, tn.x, tn.y,
+                                             globalLen, ife, bx0, by0, bx1, by1, xform);
+                    pp = pw; tp = tn; ife = 0;
+                }
+            }
+            ox = x; oy = y; pcx = x; pcy = y; prev_quad = prev_cubic = 0; break; }
+        default: break;
+        }
+        if (seg_end_len) seg_end_len[seg_idx] = globalLen;
+        seg_idx++;
+    }
+#undef PW_BBOX
+    return globalLen;
+}
+
+VGfloat vgPathLength(VGPath vgpath, VGint startSeg, VGint numSegs)
+{
+    VG_CHECK_CTX(-1.f);
+    if (vgpath == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return -1.f; }
+    cm_path_t *p = (cm_path_t *)(uintptr_t)vgpath;
+    if (p->magic != PATH_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return -1.f; }
+    if (!(p->capabilities & VG_PATH_CAPABILITY_PATH_LENGTH)) {
+        VG_SET_ERR(VG_PATH_CAPABILITY_ERROR); return -1.f; }
+    if (startSeg < 0 || numSegs < 0 || startSeg + numSegs > p->num_segments) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return -1.f; }
+    if (numSegs == 0) return 0.0f;
+
+    int total_segs = startSeg + numSegs;
+    float *slen = (float *)malloc((size_t)total_segs * sizeof(float));
+    float *elen = (float *)malloc((size_t)total_segs * sizeof(float));
+    if (!slen || !elen) { free(slen); free(elen); VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return -1.f; }
+
+    pw_walk(p, total_segs, slen, elen, NULL, NULL, NULL, NULL, NULL, NULL);
+    float start_len = slen[startSeg];
+    float end_len   = elen[startSeg + numSegs - 1];
+    free(slen); free(elen);
+    return end_len - start_len;
+}
+
+/* Get the command byte (masked ~1u) for segment at index seg_idx in path buf */
+static uint8_t path_seg_cmd_at(const cm_path_t *p, int seg_idx)
+{
+    const uint8_t *rp = p->buf;
+    const uint8_t *end = p->buf + p->buf_len;
+    int idx = 0;
+    while (rp < end && idx < p->num_segments) {
+        uint32_t hdr; memcpy(&hdr, rp, 4); rp += 4;
+        uint8_t seg = (uint8_t)(hdr & 0xFF);
+        int nc = seg_coord_count(seg);
+        if (idx == seg_idx) return seg & ~1u;
+        rp += nc * 4;
+        idx++;
+    }
+    return 0xFF;
+}
+
+void vgPointAlongPath(VGPath vgpath, VGint startSeg, VGint numSegs, VGfloat distance,
+                      VGfloat *x, VGfloat *y, VGfloat *tx, VGfloat *ty)
+{
+    VG_CHECK_CTX();
+    /* Alignment checks */
+    if ((x  && ((uintptr_t)x  & (sizeof(VGfloat)-1u)) != 0) ||
+        (y  && ((uintptr_t)y  & (sizeof(VGfloat)-1u)) != 0) ||
+        (tx && ((uintptr_t)tx & (sizeof(VGfloat)-1u)) != 0) ||
+        (ty && ((uintptr_t)ty & (sizeof(VGfloat)-1u)) != 0)) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+    }
+    if (vgpath == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_path_t *p = (cm_path_t *)(uintptr_t)vgpath;
+    if (p->magic != PATH_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    if (!(p->capabilities & VG_PATH_CAPABILITY_POINT_ALONG_PATH)) {
+        VG_SET_ERR(VG_PATH_CAPABILITY_ERROR); return; }
+    if (startSeg < 0 || numSegs < 0 || startSeg + numSegs > p->num_segments) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    /* Default output */
+    if (x) *x = 0.f; if (y) *y = 0.f;
+    if (tx) *tx = 1.f; if (ty) *ty = 0.f;
+    if (numSegs == 0) return;
+
+    /* Skip MOVE_TO segments at start and end, like the RI does */
+    int adj_start = startSeg, adj_num = numSegs;
+    while (adj_num > 0 && path_seg_cmd_at(p, adj_start) == VG_MOVE_TO) {
+        adj_start++; adj_num--;
+    }
+    while (adj_num > 0 && path_seg_cmd_at(p, adj_start + adj_num - 1) == VG_MOVE_TO) {
+        adj_num--;
+    }
+    /* All segments were MOVE_TO → return (0,0, 1,0) */
+    if (adj_num == 0) return;
+
+    int total_segs = adj_start + adj_num;
+    float *slen = (float *)malloc((size_t)total_segs * sizeof(float));
+    float *elen = (float *)malloc((size_t)total_segs * sizeof(float));
+    pw_vl_t vl = {NULL, 0, 0};
+    if (!slen || !elen) { free(slen); free(elen); return; }
+
+    pw_walk(p, total_segs, slen, elen, &vl, NULL, NULL, NULL, NULL, NULL);
+
+    /* Find start/end path lengths for the adjusted segment range */
+    float range_start = slen[adj_start];
+    float range_end   = elen[adj_start + adj_num - 1];
+    free(slen); free(elen);
+
+    /* Zero-length path → return start position, tangent (1,0) */
+    if (vl.n < 1) { pw_vl_free(&vl); return; }
+    if (range_start >= range_end) {
+        /* Find the first vertex for this segment range */
+        int vi = 0;
+        while (vi < vl.n - 1 && vl.v[vi].seg_idx < adj_start) vi++;
+        if (x) *x = vl.v[vi].x; if (y) *y = vl.v[vi].y;
+        if (tx) *tx = 1.f; if (ty) *ty = 0.f;
+        pw_vl_free(&vl); return;
+    }
+
+    /* Map distance to global path length coordinates */
+    float target = range_start + distance;
+    if (target <= range_start) {
+        /* Return start point with its tangent */
+        int vi = 0;
+        while (vi < vl.n - 1 && vl.v[vi].seg_idx < adj_start) vi++;
+        if (x) *x = vl.v[vi].x; if (y) *y = vl.v[vi].y;
+        if (tx || ty) {
+            float ttx = vl.v[vi].tx, tty = vl.v[vi].ty;
+            float l = pw_dist(ttx, tty);
+            if (l > 1e-10f) { ttx /= l; tty /= l; } else { ttx = 1.f; tty = 0.f; }
+            if (tx) *tx = ttx; if (ty) *ty = tty;
+        }
+        pw_vl_free(&vl); return;
+    }
+    if (target >= range_end) {
+        /* Return end point with its tangent */
+        int vi = vl.n - 1;
+        while (vi > 0 && vl.v[vi].seg_idx >= adj_start + adj_num) vi--;
+        if (x) *x = vl.v[vi].x; if (y) *y = vl.v[vi].y;
+        if (tx || ty) {
+            float ttx = vl.v[vi].tx, tty = vl.v[vi].ty;
+            float l = pw_dist(ttx, tty);
+            if (l > 1e-10f) { ttx /= l; tty /= l; } else { ttx = 1.f; tty = 0.f; }
+            if (tx) *tx = ttx; if (ty) *ty = tty;
+        }
+        pw_vl_free(&vl); return;
+    }
+
+    /* Narrow vertex range to [adj_start .. adj_start+adj_num) */
+    int lo = 0, hi = vl.n - 1;
+    while (lo < vl.n - 1 && vl.v[lo].seg_idx < adj_start) lo++;
+    while (hi > 0 && vl.v[hi].seg_idx >= adj_start + adj_num) hi--;
+
+    /* Linear scan for the edge containing target */
+    int idx = lo;
+    for (int i = lo; i < hi; i++) {
+        if (vl.v[i].path_len <= target && target < vl.v[i+1].path_len) {
+            idx = i; break;
+        }
+        if (i == hi - 1) idx = i;
+    }
+
+    pw_vtx_t *v0 = &vl.v[idx];
+    pw_vtx_t *v1 = &vl.v[(idx + 1 <= hi) ? idx + 1 : idx];
+
+    float edge_len = v1->path_len - v0->path_len;
+    if (edge_len > 1e-10f) {
+        float ratio = (target - v0->path_len) / edge_len;
+        if (x) *x = (1.0f - ratio) * v0->x + ratio * v1->x;
+        if (y) *y = (1.0f - ratio) * v0->y + ratio * v1->y;
+        if (tx || ty) {
+            /* Interpolate tangent then normalize, like RI does */
+            float ttx = (1.0f - ratio) * v0->tx + ratio * v1->tx;
+            float tty = (1.0f - ratio) * v0->ty + ratio * v1->ty;
+            float l = pw_dist(ttx, tty);
+            if (l > 1e-10f) { ttx /= l; tty /= l; } else { ttx = 1.f; tty = 0.f; }
+            if (tx) *tx = ttx; if (ty) *ty = tty;
+        }
+    } else {
+        if (x) *x = v0->x; if (y) *y = v0->y;
+        if (tx || ty) {
+            float ttx = v0->tx, tty = v0->ty;
+            float l = pw_dist(ttx, tty);
+            if (l > 1e-10f) { ttx /= l; tty /= l; } else { ttx = 1.f; tty = 0.f; }
+            if (tx) *tx = ttx; if (ty) *ty = tty;
+        }
+    }
+    pw_vl_free(&vl);
+}
+
+void vgPathBounds(VGPath vgpath, VGfloat *minX, VGfloat *minY, VGfloat *w, VGfloat *h)
+{
+    VG_CHECK_CTX();
+    if ((minX && ((uintptr_t)minX & (sizeof(VGfloat)-1u)) != 0) ||
+        (minY && ((uintptr_t)minY & (sizeof(VGfloat)-1u)) != 0) ||
+        (w    && ((uintptr_t)w    & (sizeof(VGfloat)-1u)) != 0) ||
+        (h    && ((uintptr_t)h    & (sizeof(VGfloat)-1u)) != 0)) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+    }
+    if (vgpath == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_path_t *p = (cm_path_t *)(uintptr_t)vgpath;
+    if (p->magic != PATH_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    if (!(p->capabilities & VG_PATH_CAPABILITY_PATH_BOUNDS)) {
+        VG_SET_ERR(VG_PATH_CAPABILITY_ERROR); return; }
+
+    if (p->num_segments == 0) {
+        /* Empty path: special return values */
+        if (minX) *minX = 0.f; if (minY) *minY = 0.f;
+        if (w) *w = -1.f; if (h) *h = -1.f;
+        return;
+    }
+
+    float bx0 = 1e30f, by0 = 1e30f, bx1 = -1e30f, by1 = -1e30f;
+    pw_walk(p, p->num_segments, NULL, NULL, NULL, &bx0, &by0, &bx1, &by1, NULL);
+
+    if (bx0 > bx1 || by0 > by1) {
+        /* Degenerate/empty: all MOVE_TO or no geometry */
+        if (minX) *minX = 0.f; if (minY) *minY = 0.f;
+        if (w) *w = -1.f; if (h) *h = -1.f;
+        return;
+    }
+    if (minX) *minX = bx0; if (minY) *minY = by0;
+    if (w) *w = bx1 - bx0; if (h) *h = by1 - by0;
+}
+
+void vgPathTransformedBounds(VGPath vgpath, VGfloat *minX, VGfloat *minY,
+                              VGfloat *w, VGfloat *h)
+{
+    VG_CHECK_CTX();
+    if ((minX && ((uintptr_t)minX & (sizeof(VGfloat)-1u)) != 0) ||
+        (minY && ((uintptr_t)minY & (sizeof(VGfloat)-1u)) != 0) ||
+        (w    && ((uintptr_t)w    & (sizeof(VGfloat)-1u)) != 0) ||
+        (h    && ((uintptr_t)h    & (sizeof(VGfloat)-1u)) != 0)) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+    }
+    if (vgpath == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_path_t *p = (cm_path_t *)(uintptr_t)vgpath;
+    if (p->magic != PATH_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    if (!(p->capabilities & VG_PATH_CAPABILITY_PATH_TRANSFORMED_BOUNDS)) {
+        VG_SET_ERR(VG_PATH_CAPABILITY_ERROR); return; }
+
+    if (p->num_segments == 0) {
+        if (minX) *minX = 0.f; if (minY) *minY = 0.f;
+        if (w) *w = -1.f; if (h) *h = -1.f;
+        return;
+    }
+
+    float bx0 = 1e30f, by0 = 1e30f, bx1 = -1e30f, by1 = -1e30f;
+    pw_walk(p, p->num_segments, NULL, NULL, NULL, &bx0, &by0, &bx1, &by1,
+            g_ctx ? g_ctx->mat_path : NULL);
+
+    if (bx0 > bx1 || by0 > by1) {
+        if (minX) *minX = 0.f; if (minY) *minY = 0.f;
+        if (w) *w = -1.f; if (h) *h = -1.f;
+        return;
+    }
+    if (minX) *minX = bx0; if (minY) *minY = by0;
+    if (w) *w = bx1 - bx0; if (h) *h = by1 - by0;
+}
+
+/* =========================================================================
+ * Software Stroke Renderer
+ * =========================================================================
+ * Converts the stroke of a path into a fill polygon and submits it to the
+ * cmodel fill pipeline.  All geometry is computed in path-user-space; the
+ * existing path-user-to-surface matrix is reused unchanged.
+ * ========================================================================= */
+
+/* (sv2 types and ptlist_t helpers are defined above, before path query functions) */
 
 /* ---- Bezier flattening ---- */
 #define FLAT_TOL2 0.0625f  /* (0.25 px)^2 */
@@ -1619,8 +2680,8 @@ static void flat_arc(ptlist_t *l, sv2 p0, float rx, float ry,
     float dang = acosf(dot);
     if(!ccw && sv2_cross(SV2(ux,uy),SV2(vx,vy)) > 0.f) dang = -dang;
     if( ccw && sv2_cross(SV2(ux,uy),SV2(vx,vy)) < 0.f) dang = -dang;
-    if(!large && fabsf(dang) > (float)M_PI) dang -= (dang>0?1.f:-1.f)*2.f*(float)M_PI;
-    if( large && fabsf(dang) < (float)M_PI) dang += (dang>0?1.f:-1.f)*2.f*(float)M_PI;
+    if(!large && fabsf(dang) > (float)M_PI) dang = (dang>0?1.f:-1.f)*2.f*(float)M_PI - dang;
+    if( large && fabsf(dang) < (float)M_PI) dang = (dang>0?1.f:-1.f)*2.f*(float)M_PI - dang;
     int ns = (int)(fabsf(dang)/0.08f) + 2; if(ns>256)ns=256;
     for(int i=1;i<=ns;i++){
         float a = ang1 + (float)i/(float)ns * dang;
@@ -2129,6 +3190,15 @@ static void draw_stroke(cm_ctx_t *ctx, cm_path_t *src_path)
         vg_cmodel_reg_write_f(cm, VG_REG_PATH_SCALE, 1.0f);
         vg_cmodel_reg_write_f(cm, VG_REG_PATH_BIAS,  0.0f);
 
+        /* Masking */
+        if (ctx->masking && surf->mask_buf) {
+            vg_cmodel_set_mask_ptr(cm, surf->mask_buf);
+            vg_cmodel_reg_write(cm, VG_REG_MASK_STRIDE, (uint32_t)surf->width);
+            vg_cmodel_reg_write(cm, VG_REG_MASK_EN, 1);
+        } else {
+            vg_cmodel_reg_write(cm, VG_REG_MASK_EN, 0);
+        }
+
         vg_cmodel_set_path_ptr(cm, dst->buf, (uint32_t)dst->buf_len);
         vg_cmodel_reg_write(cm, VG_REG_PATH_KICK, 1);
     }
@@ -2179,6 +3249,15 @@ void vgDrawPath(VGPath path, VGbitfield paintModes)
     /* Path scale/bias: coords already converted to floats during vgAppendPathData */
     vg_cmodel_reg_write_f(cm, VG_REG_PATH_SCALE, 1.0f);
     vg_cmodel_reg_write_f(cm, VG_REG_PATH_BIAS,  0.0f);
+
+    /* Masking */
+    if (g_ctx->masking && surf->mask_buf) {
+        vg_cmodel_set_mask_ptr(cm, surf->mask_buf);
+        vg_cmodel_reg_write(cm, VG_REG_MASK_STRIDE, (uint32_t)surf->width);
+        vg_cmodel_reg_write(cm, VG_REG_MASK_EN, 1);
+    } else {
+        vg_cmodel_reg_write(cm, VG_REG_MASK_EN, 0);
+    }
 
     if(paintModes & VG_FILL_PATH){
         /* Submit path buffer to cmodel */
@@ -2506,6 +3585,7 @@ VGImage vgCreateImage(VGImageFormat fmt, VGint w, VGint h, VGbitfield allowedQua
     img->allowed_quality = allowedQuality;
     img->bpp             = bpp;
     img->parent_handle   = VG_INVALID_HANDLE;
+    img->row_stride      = (bpp > 0 ? bpp : 1) * w;
     img->pixels          = (uint8_t *)calloc((size_t)(w * h), (size_t)(bpp > 0 ? bpp : 1));
     if (!img->pixels) { free(img); VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
     return (VGImage)(uintptr_t)img;
@@ -2517,7 +3597,9 @@ void vgDestroyImage(VGImage image)
     cm_image_t *img = (cm_image_t *)(uintptr_t)image;
     if (img->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     img->magic = 0;
-    free(img->pixels);
+    /* Only free pixel buffer if this is a root image (children share parent buffer) */
+    if (img->parent_handle == VG_INVALID_HANDLE)
+        free(img->pixels);
     free(img);
 }
 /* Forward declaration for format index helper (defined in filter section) */
@@ -2559,12 +3641,12 @@ void vgClearImage(VGImage image, VGint x, VGint y, VGint w, VGint h)
     if (img->bpp == 4) {
         uint32_t fill; memcpy(&fill, px, 4);
         for (int row = y0; row < y1; row++) {
-            uint32_t *fdst = (uint32_t *)(img->pixels + (size_t)(row * img->width + x0) * 4);
+            uint32_t *fdst = (uint32_t *)(img->pixels + (size_t)row * (size_t)img->row_stride + (size_t)x0 * 4);
             for (int col = 0; col < (x1-x0); col++) fdst[col] = fill;
         }
     } else {
         for (int row = y0; row < y1; row++) {
-            uint8_t *dst = img->pixels + (size_t)(row * img->width + x0) * (size_t)img->bpp;
+            uint8_t *dst = img->pixels + (size_t)row * (size_t)img->row_stride + (size_t)x0 * (size_t)img->bpp;
             memset(dst, px[0], (size_t)(x1 - x0) * img->bpp);
         }
     }
@@ -2595,7 +3677,7 @@ void vgImageSubData(VGImage image, const void *data, VGint dataStride,
         int copy_w = copy_x1 - copy_x0;
         const uint8_t *src = (const uint8_t *)data + (size_t)row * (size_t)dataStride
                              + (size_t)(copy_x0 * src_bpp);
-        uint8_t *dst = img->pixels + (size_t)(dst_y * img->width + x + copy_x0) * (size_t)img->bpp;
+        uint8_t *dst = img->pixels + (size_t)dst_y * (size_t)img->row_stride + (size_t)(x + copy_x0) * (size_t)img->bpp;
         if (src_bpp == 4 && img->bpp == 4 && dataFormat == img->format) {
             memcpy(dst, src, (size_t)copy_w * 4);
         } else if (src_bpp == 4 && img->bpp == 4) {
@@ -2646,14 +3728,14 @@ void vgGetImageSubData(VGImage image, void *data, VGint dataStride,
         if (img->bpp == 4 && dst_bpp == 4 && img->format == dataFormat) {
             /* Same 4-byte format: raw copy */
             const uint8_t *src = img->pixels
-                               + (size_t)(src_y * img->width + x + copy_x0) * 4;
+                               + (size_t)src_y * (size_t)img->row_stride + (size_t)(x + copy_x0) * 4;
             memcpy(dst, src, (size_t)copy_w * 4);
         } else if (img->bpp == 4 && dst_bpp == 4) {
             /* Different 4-byte formats: convert via float RGBA */
             int src_idx[4]; cm_fmt_idx(img->format, src_idx);
             int dst_idx[4]; cm_fmt_idx(dataFormat, dst_idx);
             const uint8_t *src = img->pixels
-                               + (size_t)(src_y * img->width + x + copy_x0) * 4;
+                               + (size_t)src_y * (size_t)img->row_stride + (size_t)(x + copy_x0) * 4;
             for (int i = 0; i < copy_w; i++) {
                 const uint8_t *sp = src + i * 4;
                 uint8_t *dp = dst + i * 4;
@@ -2669,7 +3751,7 @@ void vgGetImageSubData(VGImage image, void *data, VGint dataStride,
         } else {
             /* Fallback: raw copy (same as before) */
             const uint8_t *src = img->pixels
-                               + (size_t)(src_y * img->width + x + copy_x0) * (size_t)img->bpp;
+                               + (size_t)src_y * (size_t)img->row_stride + (size_t)(x + copy_x0) * (size_t)img->bpp;
             memcpy(dst, src, (size_t)(copy_w * (dst_bpp < img->bpp ? dst_bpp : img->bpp)));
         }
     }
@@ -2694,13 +3776,9 @@ VGImage vgChildImage(VGImage parent, VGint x, VGint y, VGint w, VGint h)
     child->allowed_quality = p->allowed_quality;
     child->bpp             = p->bpp;
     child->parent_handle   = parent;
-    child->pixels          = (uint8_t *)calloc((size_t)(w * h), (size_t)(p->bpp > 0 ? p->bpp : 1));
-    if (!child->pixels) { free(child); VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
-    /* Copy the parent region into child pixels */
-    for (int row = 0; row < h; row++)
-        memcpy(child->pixels + (size_t)(row * w) * (size_t)p->bpp,
-               p->pixels + (size_t)((y + row) * p->width + x) * (size_t)p->bpp,
-               (size_t)w * (size_t)p->bpp);
+    /* Share parent's pixel buffer: child->pixels points into parent's buffer */
+    child->row_stride      = p->row_stride;
+    child->pixels          = p->pixels + (size_t)(y * p->row_stride + x * p->bpp);
     return (VGImage)(uintptr_t)child;
 }
 VGImage vgGetParent(VGImage image)
@@ -2752,9 +3830,9 @@ void vgCopyImage(VGImage dst, VGint dx, VGint dy, VGImage src, VGint sx, VGint s
     int bpp = s->bpp < d->bpp ? s->bpp : d->bpp;
     for (int64_t row = 0; row < cph; row++) {
         const uint8_t *src_row = s->pixels +
-            (size_t)((sy0 + row) * s->width + sx0) * (size_t)s->bpp;
+            (size_t)(sy0 + row) * (size_t)s->row_stride + (size_t)sx0 * (size_t)s->bpp;
         uint8_t *dst_row = d->pixels +
-            (size_t)((dy0 + row) * d->width + dx0) * (size_t)d->bpp;
+            (size_t)(dy0 + row) * (size_t)d->row_stride + (size_t)dx0 * (size_t)d->bpp;
         memcpy(dst_row, src_row, (size_t)cpw * (size_t)bpp);
     }
 }
@@ -3060,7 +4138,7 @@ void vgSetPixels(VGint dx, VGint dy, VGImage src, VGint sx, VGint sy, VGint w, V
     for (int64_t j = 0; j < H; j++) {
         int iy = (int)(sy0 + j), fy = (int)(dy0 + j);
         int fb_row = SH - 1 - fy;
-        const uint8_t *row = img->pixels + (size_t)(iy * img->width) * (size_t)img->bpp;
+        const uint8_t *row = img->pixels + (size_t)iy * (size_t)img->row_stride;
         uint32_t *fb_ptr = fb + fb_row * SW + (int)dx0;
         for (int64_t i = 0; i < W; i++) {
             int ix = (int)(sx0 + i);
@@ -3164,7 +4242,7 @@ void vgGetPixels(VGImage dst, VGint dx, VGint dy, VGint sx, VGint sy, VGint w, V
         int fy = (int)(sy0 + j), iy = (int)(dy0 + j);
         int fb_row = SH - 1 - fy;
         const uint32_t *fb_ptr = fb + fb_row * SW + (int)sx0;
-        uint8_t *row = img->pixels + (size_t)(iy * img->width) * (size_t)img->bpp;
+        uint8_t *row = img->pixels + (size_t)iy * (size_t)img->row_stride;
         for (int64_t i = 0; i < W; i++) {
             int ix = (int)(dx0 + i);
             uint32_t p = fb_ptr[i];
@@ -3339,7 +4417,7 @@ static void cm_fmt_idx(VGImageFormat fmt, int idx[4])
 /* Read pixel (x,y) from image into float rgba[4] in [0,1]. */
 static void cm_read_px(const cm_image_t *img, int x, int y, float *rgba)
 {
-    const uint8_t *p = img->pixels + (size_t)(y * img->width + x) * (size_t)img->bpp;
+    const uint8_t *p = img->pixels + (size_t)y * (size_t)img->row_stride + (size_t)x * (size_t)img->bpp;
     if (img->bpp == 4) {
         int idx[4]; cm_fmt_idx(img->format, idx);
         rgba[0] = p[idx[0]] / 255.f;
@@ -3367,7 +4445,7 @@ static void cm_read_px(const cm_image_t *img, int x, int y, float *rgba)
 /* Write float rgba[4] to pixel (x,y) in image. */
 static void cm_write_px(cm_image_t *img, int x, int y, const float *rgba)
 {
-    uint8_t *p = img->pixels + (size_t)(y * img->width + x) * (size_t)img->bpp;
+    uint8_t *p = img->pixels + (size_t)y * (size_t)img->row_stride + (size_t)x * (size_t)img->bpp;
     if (img->bpp == 4) {
         int idx[4]; cm_fmt_idx(img->format, idx);
         p[idx[0]] = (uint8_t)(clampf01(rgba[0]) * 255.f + 0.5f);
