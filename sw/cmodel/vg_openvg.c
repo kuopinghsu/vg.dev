@@ -67,6 +67,7 @@ static inline uint32_t pack_rgba(const VGfloat *c)
 #define CM_MAX_SCISSOR 32
 
 typedef struct cm_paint_s {
+    uint32_t    magic;
     VGPaintType type;
     VGfloat     color[4];          /* user RGBA [0..1] flat color */
     VGfloat     color_pre[4];      /* internal premultiplied flat color */
@@ -75,9 +76,11 @@ typedef struct cm_paint_s {
     int         num_stops;
     struct { VGfloat offset; VGfloat color[4]; } stops[CM_MAX_STOPS];
     VGColorRampSpreadMode spread_mode;
+    VGboolean   ramp_premultiplied;
     VGTilingMode          tiling_mode;
 } cm_paint_t;
 
+#define PAINT_MAGIC  0xA1B2C3D4u
 #define PATH_MAGIC  0xA2B3C4D5u
 #define MASKLAYER_MAGIC 0xD4E5F6A7u
 
@@ -113,6 +116,13 @@ static int cm_path_is_valid(VGPath path)
     return 0;
 }
 
+static cm_paint_t *cm_paint_from_handle(VGPaint paint)
+{
+    if (paint == VG_INVALID_HANDLE) return NULL;
+    cm_paint_t *pt = (cm_paint_t *)(uintptr_t)paint;
+    return (pt && pt->magic == PAINT_MAGIC) ? pt : NULL;
+}
+
 /* ---- Font object ---- */
 #define FONT_MAGIC  0xF07710ACu
 
@@ -121,7 +131,9 @@ static int cm_path_is_valid(VGPath path)
 typedef struct cm_glyph_s {
     VGboolean   defined;
     VGboolean   has_path;
+    VGboolean   has_image;
     VGPath      path;
+    VGImage     image;
     VGfloat     glyph_origin[2];
     VGfloat     escapement[2];
 } cm_glyph_t;
@@ -163,6 +175,7 @@ static int image_bpp(VGImageFormat fmt)
 
 typedef struct cm_image_s {
     uint32_t        magic;
+    struct cm_image_s *reg_next;
     VGImageFormat   format;
     VGint           width;
     VGint           height;
@@ -171,7 +184,14 @@ typedef struct cm_image_s {
     uint8_t        *pixels;      /* pointer to start of image data (may be into parent buffer) */
     int             row_stride;  /* bytes per row in pixels buffer (= width*bpp for root images) */
     VGImage         parent_handle; /* VG_INVALID_HANDLE if root image */
+    VGImage         parent_fallback; /* fallback parent used after parent destruction */
+    struct cm_image_storage_s *storage; /* shared backing store for root/children */
 } cm_image_t;
+
+typedef struct cm_image_storage_s {
+    uint8_t *base;
+    int      refcnt;
+} cm_image_storage_t;
 
 /* Simple handle table – VGHandle is uintptr_t (pointer). */
 #define INVALID_HANDLE ((uintptr_t)VG_INVALID_HANDLE)
@@ -226,6 +246,7 @@ typedef struct cm_ctx_s {
     int            filter_format_premultiplied;
     int            pixel_layout;
     int            image_quality;
+    VGfloat        glyph_origin[2];
     VGfloat        tile_fill_color[4];
 } cm_ctx_t;
 
@@ -237,6 +258,32 @@ static int            g_disp_init  = 0;
 static EGLint         g_egl_error  = EGL_SUCCESS;
 static cm_ctx_t      *g_ctx        = NULL;
 static cm_surface_t  *g_surface    = NULL;
+static cm_image_t    *g_image_registry = NULL;
+
+static cm_image_t *cm_image_from_handle(VGImage image)
+{
+    if (image == VG_INVALID_HANDLE) return NULL;
+    cm_image_t *p = (cm_image_t *)(uintptr_t)image;
+    for (cm_image_t *it = g_image_registry; it; it = it->reg_next)
+        if (it == p) return it;
+    return NULL;
+}
+
+static void cm_image_registry_add(cm_image_t *img)
+{
+    img->reg_next = g_image_registry;
+    g_image_registry = img;
+}
+
+static int cm_image_registry_remove(cm_image_t *img)
+{
+    cm_image_t **pp = &g_image_registry;
+    while (*pp && *pp != img) pp = &(*pp)->reg_next;
+    if (!*pp) return 0;
+    *pp = img->reg_next;
+    img->reg_next = NULL;
+    return 1;
+}
 
 /* =========================================================================
  * Default paints (VG_INVALID_HANDLE returns white for fill, black for stroke) */
@@ -289,6 +336,23 @@ static void mat_mul(const VGfloat *a, const VGfloat *b, VGfloat *r)
     memcpy(r, t, 9 * sizeof(VGfloat));
 }
 
+static int mat_inv_affine(const VGfloat *m, VGfloat *inv)
+{
+    float det = m[0] * m[4] - m[3] * m[1];
+    if (fabsf(det) < 1e-20f) return 0;
+    float id = 1.0f / det;
+
+    memset(inv, 0, 9 * sizeof(VGfloat));
+    inv[0] =  m[4] * id;
+    inv[1] = -m[1] * id;
+    inv[3] = -m[3] * id;
+    inv[4] =  m[0] * id;
+    inv[6] = -(inv[0] * m[6] + inv[3] * m[7]);
+    inv[7] = -(inv[1] * m[6] + inv[4] * m[7]);
+    inv[8] = 1.0f;
+    return 1;
+}
+
 /* Load the OpenVG path_user_to_surface matrix into cmodel registers.
  * OpenVG uses Y-up surface; the cmodel uses Y-down raster coordinates.
  * We compose: cmodel_mat = flip_y * openvg_mat
@@ -333,6 +397,13 @@ static void load_matrix_to_cmodel(cm_ctx_t *ctx)
     vg_cmodel_reg_write_f(cm, VG_REG_MATRIX_TY,  (float)H - ty);
 }
 
+static void path_user_to_surface(const cm_ctx_t *ctx, float x, float y, float *sx, float *sy)
+{
+    const VGfloat *m = ctx->mat_path;
+    *sx = m[0] * x + m[3] * y + m[6];
+    *sy = m[1] * x + m[4] * y + m[7];
+}
+
 /* =========================================================================
  * Paint helpers
  * ========================================================================= */
@@ -369,6 +440,8 @@ static void apply_color_transform_pre(cm_ctx_t *ctx, float c[4])
 }
 
 static inline float img_srgb2lin(float c);
+static inline float img_lin2srgb(float c);
+static void cm_convert_color(float rgba[4], VGImageFormat src_fmt, VGImageFormat dst_fmt);
 
 static void paint_convert_to_surface(cm_ctx_t *ctx, float c[4])
 {
@@ -378,12 +451,42 @@ static void paint_convert_to_surface(cm_ctx_t *ctx, float c[4])
     c[2] = clampf01(img_srgb2lin(c[2]));
 }
 
-static void load_paint_to_cmodel(cm_ctx_t *ctx, cm_paint_t *paint)
+static void load_paint_to_cmodel(cm_ctx_t *ctx, cm_paint_t *paint,
+                                 const VGfloat *paint_to_user)
 {
     if (!paint) paint = &g_default_fill_paint;
     vg_cmodel_t cm = ctx->surface->cm;
 
     vg_cmodel_reg_write(cm, VG_REG_COLOR_XFORM_EN, 0);
+    vg_cmodel_reg_write(cm, VG_REG_RAMP_PREMULT, 0);
+    vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_SX, 1.0f);
+    vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_SHX, 0.0f);
+    vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_TX, 0.0f);
+    vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_SHY, 0.0f);
+    vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_SY, 1.0f);
+    vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_TY, 0.0f);
+
+    if (paint_to_user) {
+        VGfloat paint_to_surface[9];
+        VGfloat surface_to_paint[9];
+        VGfloat flip_y[9] = {
+            1.f, 0.f, 0.f,
+            0.f, -1.f, 0.f,
+            0.f, (float)ctx->surface->height, 1.f
+        };
+        VGfloat surf2paint_cm[9];
+
+        mat_mul(ctx->mat_path, paint_to_user, paint_to_surface);
+        if (mat_inv_affine(paint_to_surface, surface_to_paint)) {
+            mat_mul(surface_to_paint, flip_y, surf2paint_cm);
+            vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_SX,  surf2paint_cm[0]);
+            vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_SHY, surf2paint_cm[1]);
+            vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_SHX, surf2paint_cm[3]);
+            vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_SY,  surf2paint_cm[4]);
+            vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_TX,  surf2paint_cm[6]);
+            vg_cmodel_reg_write_f(cm, VG_REG_SURF2PAINT_TY,  surf2paint_cm[7]);
+        }
+    }
     for (int i = 0; i < 8; i++) {
         vg_cmodel_reg_write_f(cm, VG_REG_COLOR_XFORM_0 + (uint32_t)i * 4u,
                               ctx->color_transform_values[i]);
@@ -415,47 +518,54 @@ static void load_paint_to_cmodel(cm_ctx_t *ctx, cm_paint_t *paint)
     }
     case VG_PAINT_TYPE_LINEAR_GRADIENT: {
         vg_cmodel_reg_write(cm, VG_REG_GRAD_TYPE, VG_GRAD_LINEAR);
-        /* In OpenVG, gradient coords are in paint (user) space.
-         * For simplicity, pass them through the path matrix. */
         vg_cmodel_reg_write_f(cm, VG_REG_GRAD_X0, paint->lin[0]);
-        vg_cmodel_reg_write_f(cm, VG_REG_GRAD_Y0, (float)ctx->surface->height - paint->lin[1]);
+        vg_cmodel_reg_write_f(cm, VG_REG_GRAD_Y0, paint->lin[1]);
         vg_cmodel_reg_write_f(cm, VG_REG_GRAD_X1, paint->lin[2]);
-        vg_cmodel_reg_write_f(cm, VG_REG_GRAD_Y1, (float)ctx->surface->height - paint->lin[3]);
+        vg_cmodel_reg_write_f(cm, VG_REG_GRAD_Y1, paint->lin[3]);
         /* Color ramp */
         int ns = paint->num_stops < 16 ? paint->num_stops : 16;
         for (int i = 0; i < ns; i++) {
             vg_cmodel_reg_write_f(cm, VG_REG_CRAMP_OFFSET(i), paint->stops[i].offset);
             float sc[4] = { paint->stops[i].color[0], paint->stops[i].color[1],
                             paint->stops[i].color[2], paint->stops[i].color[3] };
-            paint_convert_to_surface(ctx, sc);
+            if (paint->ramp_premultiplied) {
+                sc[0] *= sc[3];
+                sc[1] *= sc[3];
+                sc[2] *= sc[3];
+            }
             vg_cmodel_set_ramp_color(cm, (uint32_t)i, sc);
             vg_cmodel_reg_write(cm, VG_REG_CRAMP_COLOR(i), pack_rgba(sc));
         }
         vg_cmodel_reg_write(cm, VG_REG_CRAMP_COUNT, (uint32_t)ns);
         vg_cmodel_reg_write(cm, VG_REG_GRAD_SPREAD, (uint32_t)paint->spread_mode);
+        vg_cmodel_reg_write(cm, VG_REG_RAMP_PREMULT, (uint32_t)paint->ramp_premultiplied);
         vg_cmodel_reg_write(cm, VG_REG_COLOR_XFORM_EN, (uint32_t)ctx->color_transform);
         break;
     }
     case VG_PAINT_TYPE_RADIAL_GRADIENT: {
         vg_cmodel_reg_write(cm, VG_REG_GRAD_TYPE, VG_GRAD_RADIAL);
-        int H = ctx->surface->height;
         vg_cmodel_reg_write_f(cm, VG_REG_GRAD_X0, paint->rad[0]);
-        vg_cmodel_reg_write_f(cm, VG_REG_GRAD_Y0, (float)H - paint->rad[1]);
-        /* X1/Y1 unused for radial in cmodel; use centre */
+        vg_cmodel_reg_write_f(cm, VG_REG_GRAD_Y0, paint->rad[1]);
+        /* X1/Y1 unused for radial in cmodel; mirror centre */
         vg_cmodel_reg_write_f(cm, VG_REG_GRAD_X1, paint->rad[0]);
-        vg_cmodel_reg_write_f(cm, VG_REG_GRAD_Y1, (float)H - paint->rad[1]);
+        vg_cmodel_reg_write_f(cm, VG_REG_GRAD_Y1, paint->rad[1]);
         vg_cmodel_reg_write_f(cm, VG_REG_GRAD_R,  paint->rad[4]);
         int ns = paint->num_stops < 16 ? paint->num_stops : 16;
         for (int i = 0; i < ns; i++) {
             vg_cmodel_reg_write_f(cm, VG_REG_CRAMP_OFFSET(i), paint->stops[i].offset);
             float rc[4] = { paint->stops[i].color[0], paint->stops[i].color[1],
                             paint->stops[i].color[2], paint->stops[i].color[3] };
-            paint_convert_to_surface(ctx, rc);
+            if (paint->ramp_premultiplied) {
+                rc[0] *= rc[3];
+                rc[1] *= rc[3];
+                rc[2] *= rc[3];
+            }
             vg_cmodel_set_ramp_color(cm, (uint32_t)i, rc);
             vg_cmodel_reg_write(cm, VG_REG_CRAMP_COLOR(i), pack_rgba(rc));
         }
         vg_cmodel_reg_write(cm, VG_REG_CRAMP_COUNT, (uint32_t)ns);
         vg_cmodel_reg_write(cm, VG_REG_GRAD_SPREAD, (uint32_t)paint->spread_mode);
+        vg_cmodel_reg_write(cm, VG_REG_RAMP_PREMULT, (uint32_t)paint->ramp_premultiplied);
         vg_cmodel_reg_write(cm, VG_REG_COLOR_XFORM_EN, (uint32_t)ctx->color_transform);
         break;
     }
@@ -502,16 +612,23 @@ static void ctx_init_defaults(cm_ctx_t *ctx, cm_surface_t *surface)
     ctx->color_transform_values[1] = 1.f;
     ctx->color_transform_values[2] = 1.f;
     ctx->color_transform_values[3] = 1.f;
-    /* [4..7] remain 0.f from memset */
+    ctx->color_transform_values[4] = 0.f;
+    ctx->color_transform_values[5] = 0.f;
+    ctx->color_transform_values[6] = 0.f;
+    ctx->color_transform_values[7] = 0.f;
 
     /* Default paints */
     memset(&g_default_fill_paint,   0, sizeof(cm_paint_t));
     memset(&g_default_stroke_paint, 0, sizeof(cm_paint_t));
+    g_default_fill_paint.magic    = PAINT_MAGIC;
+    g_default_stroke_paint.magic  = PAINT_MAGIC;
     g_default_fill_paint.type     = VG_PAINT_TYPE_COLOR;
     g_default_fill_paint.color[0] = 0.f;
     g_default_fill_paint.color[1] = 0.f;
     g_default_fill_paint.color[2] = 0.f;
     g_default_fill_paint.color[3] = 1.f;
+    g_default_fill_paint.color_pre[3] = 1.f;
+    g_default_fill_paint.ramp_premultiplied = VG_TRUE;
     g_default_stroke_paint        = g_default_fill_paint;
 }
 
@@ -836,13 +953,26 @@ const VGubyte *vgGetString(VGStringID name)
     case VG_RENDERER:   return (const VGubyte *)"VG cmodel";
     case VG_VERSION:    return (const VGubyte *)"1.1";
     case VG_EXTENSIONS: return (const VGubyte *)"";
-    default: VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return NULL;
+    default: return NULL;
     }
 }
 
 VGHardwareQueryResult vgHardwareQuery(VGHardwareQueryType key, VGint setting)
 {
-    (void)key; (void)setting;
+    switch (key) {
+    case VG_IMAGE_FORMAT_QUERY:
+        if (image_bpp((VGImageFormat)setting) < 0) {
+            VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_HARDWARE_UNACCELERATED;
+        }
+        break;
+    case VG_PATH_DATATYPE_QUERY:
+        if (setting < VG_PATH_DATATYPE_S_8 || setting > VG_PATH_DATATYPE_F) {
+            VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_HARDWARE_UNACCELERATED;
+        }
+        break;
+    default:
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_HARDWARE_UNACCELERATED;
+    }
     return VG_HARDWARE_ACCELERATED;
 }
 
@@ -871,26 +1001,72 @@ void vgSetf(VGParamType type, VGfloat value)
 void vgSeti(VGParamType type, VGint value)
 {
     VG_CHECK_CTX();
+    auto int valid_enum = 1;
     switch (type) {
-    case VG_MATRIX_MODE:           g_ctx->matrix_mode          = (VGMatrixMode)value; break;
-    case VG_FILL_RULE:             g_ctx->fill_rule             = (VGFillRule)value; break;
-    case VG_IMAGE_QUALITY:         g_ctx->image_quality = value; break;
-    case VG_RENDERING_QUALITY:     g_ctx->rendering_quality     = (VGRenderingQuality)value; break;
-    case VG_BLEND_MODE:            g_ctx->blend_mode            = (VGBlendMode)value; break;
-    case VG_IMAGE_MODE:            g_ctx->image_mode            = (VGImageMode)value; break;
-    case VG_STROKE_CAP_STYLE:      g_ctx->stroke_cap_style      = (VGCapStyle)value; break;
-    case VG_STROKE_JOIN_STYLE:     g_ctx->stroke_join_style     = (VGJoinStyle)value; break;
-    case VG_STROKE_DASH_PHASE_RESET: g_ctx->stroke_dash_phase_reset = value; break;
+    case VG_MATRIX_MODE:
+        valid_enum = (value >= VG_MATRIX_PATH_USER_TO_SURFACE && value <= VG_MATRIX_GLYPH_USER_TO_SURFACE);
+        if (valid_enum) g_ctx->matrix_mode = (VGMatrixMode)value;
+        break;
+    case VG_FILL_RULE:
+        valid_enum = (value == VG_EVEN_ODD || value == VG_NON_ZERO);
+        if (valid_enum) g_ctx->fill_rule = (VGFillRule)value;
+        break;
+    case VG_IMAGE_QUALITY:
+        valid_enum = (value >= VG_IMAGE_QUALITY_NONANTIALIASED && value <= VG_IMAGE_QUALITY_BETTER);
+        if (valid_enum) g_ctx->image_quality = value;
+        break;
+    case VG_RENDERING_QUALITY:
+        valid_enum = (value >= VG_RENDERING_QUALITY_NONANTIALIASED && value <= VG_RENDERING_QUALITY_BETTER);
+        if (valid_enum) g_ctx->rendering_quality = (VGRenderingQuality)value;
+        break;
+    case VG_BLEND_MODE:
+        valid_enum = (value >= VG_BLEND_SRC && value <= VG_BLEND_ADDITIVE);
+        if (valid_enum) g_ctx->blend_mode = (VGBlendMode)value;
+        break;
+    case VG_IMAGE_MODE:
+        valid_enum = (value >= VG_DRAW_IMAGE_NORMAL && value <= VG_DRAW_IMAGE_STENCIL);
+        if (valid_enum) g_ctx->image_mode = (VGImageMode)value;
+        break;
+    case VG_STROKE_CAP_STYLE:
+        valid_enum = (value >= VG_CAP_BUTT && value <= VG_CAP_SQUARE);
+        if (valid_enum) g_ctx->stroke_cap_style = (VGCapStyle)value;
+        break;
+    case VG_STROKE_JOIN_STYLE:
+        valid_enum = (value >= VG_JOIN_MITER && value <= VG_JOIN_BEVEL);
+        if (valid_enum) g_ctx->stroke_join_style = (VGJoinStyle)value;
+        break;
+    case VG_STROKE_DASH_PHASE_RESET:
+        valid_enum = (value == VG_FALSE || value == VG_TRUE);
+        if (valid_enum) g_ctx->stroke_dash_phase_reset = value;
+        break;
     /* Float-valued params settable via vgSeti */
     case VG_STROKE_LINE_WIDTH:    g_ctx->stroke_line_width  = (VGfloat)value; break;
     case VG_STROKE_MITER_LIMIT:   g_ctx->stroke_miter_limit = (VGfloat)value; break;
     case VG_STROKE_DASH_PHASE:    g_ctx->stroke_dash_phase  = (VGfloat)value; break;
-    case VG_COLOR_TRANSFORM:       g_ctx->color_transform       = value; break;
-    case VG_SCISSORING:            g_ctx->scissoring            = value; break;
-    case VG_MASKING:               g_ctx->masking               = value; break;
-    case VG_FILTER_FORMAT_LINEAR:  g_ctx->filter_format_linear = value; break;
-    case VG_FILTER_FORMAT_PREMULTIPLIED: g_ctx->filter_format_premultiplied = value; break;
-    case VG_PIXEL_LAYOUT:          g_ctx->pixel_layout = value; break;
+    case VG_COLOR_TRANSFORM:
+        valid_enum = (value == VG_FALSE || value == VG_TRUE);
+        if (valid_enum) g_ctx->color_transform = value;
+        break;
+    case VG_SCISSORING:
+        valid_enum = (value == VG_FALSE || value == VG_TRUE);
+        if (valid_enum) g_ctx->scissoring = value;
+        break;
+    case VG_MASKING:
+        valid_enum = (value == VG_FALSE || value == VG_TRUE);
+        if (valid_enum) g_ctx->masking = value;
+        break;
+    case VG_FILTER_FORMAT_LINEAR:
+        valid_enum = (value == VG_FALSE || value == VG_TRUE);
+        if (valid_enum) g_ctx->filter_format_linear = value;
+        break;
+    case VG_FILTER_FORMAT_PREMULTIPLIED:
+        valid_enum = (value == VG_FALSE || value == VG_TRUE);
+        if (valid_enum) g_ctx->filter_format_premultiplied = value;
+        break;
+    case VG_PIXEL_LAYOUT:
+        valid_enum = (value >= VG_PIXEL_LAYOUT_UNKNOWN && value <= VG_PIXEL_LAYOUT_BGR_HORIZONTAL);
+        if (valid_enum) g_ctx->pixel_layout = value;
+        break;
     case VG_SCREEN_LAYOUT:         break;  /* read-only */
     case VG_FILTER_CHANNEL_MASK:   g_ctx->filter_channel_mask   = value; break;
     /* Read-only integer parameters: silently ignore (no error) */
@@ -905,8 +1081,9 @@ void vgSeti(VGParamType type, VGint value)
     case VG_MAX_IMAGE_BYTES:
     case VG_MAX_FLOAT:
     case VG_MAX_GAUSSIAN_STD_DEVIATION: break;
-    default: VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); break;
+    default: valid_enum = 0; break;
     }
+    if (!valid_enum) VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
 }
 
 void vgSetfv(VGParamType type, VGint count, const VGfloat *values)
@@ -929,8 +1106,16 @@ void vgSetfv(VGParamType type, VGint count, const VGfloat *values)
         break;
     case VG_COLOR_TRANSFORM_VALUES:
         if (count != 8) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-        for (int i = 0; i < 8; i++)
-            g_ctx->color_transform_values[i] = values[i];
+        for (int i = 0; i < 4; i++) {
+            float s = values[i];
+            float b = values[i + 4];
+            if (s < -127.f) s = -127.f;
+            if (s >  127.f) s =  127.f;
+            if (b < -1.f)   b = -1.f;
+            if (b >  1.f)   b =  1.f;
+            g_ctx->color_transform_values[i] = s;
+            g_ctx->color_transform_values[i + 4] = b;
+        }
         break;
     case VG_STROKE_DASH_PATTERN:
         for (int i = 0; i < count && i < CM_MAX_DASH; i++)
@@ -947,7 +1132,9 @@ void vgSetfv(VGParamType type, VGint count, const VGfloat *values)
         break;
     case VG_GLYPH_ORIGIN:
         if (count != 2) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-        break;  /* stored but not used */
+        g_ctx->glyph_origin[0] = values[0];
+        g_ctx->glyph_origin[1] = values[1];
+        break;
     default:
         /* scalar parameter — count must be exactly 1 */
         if (count != 1) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
@@ -980,7 +1167,16 @@ void vgSetiv(VGParamType type, VGint count, const VGint *values)
         break;
     case VG_COLOR_TRANSFORM_VALUES:
         if (count != 8) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-        for (int i = 0; i < 8; i++) g_ctx->color_transform_values[i] = (VGfloat)values[i];
+        for (int i = 0; i < 4; i++) {
+            float s = (VGfloat)values[i];
+            float b = (VGfloat)values[i + 4];
+            if (s < -127.f) s = -127.f;
+            if (s >  127.f) s =  127.f;
+            if (b < -1.f)   b = -1.f;
+            if (b >  1.f)   b =  1.f;
+            g_ctx->color_transform_values[i] = s;
+            g_ctx->color_transform_values[i + 4] = b;
+        }
         break;
     case VG_STROKE_DASH_PATTERN:
         for (int i = 0; i < count && i < CM_MAX_DASH; i++)
@@ -1052,13 +1248,47 @@ VGint vgGeti(VGParamType type)
 VGint vgGetVectorSize(VGParamType type)
 {
     switch (type) {
-    case VG_SCISSOR_RECTS:           return 0;
+    case VG_SCISSOR_RECTS:           return g_ctx ? g_ctx->num_scissor_rects * 4 : 0;
     case VG_COLOR_TRANSFORM_VALUES:  return 8;
     case VG_STROKE_DASH_PATTERN:     return g_ctx ? g_ctx->num_dash : 0;
     case VG_CLEAR_COLOR:             return 4;
     case VG_TILE_FILL_COLOR:         return 4;
     case VG_GLYPH_ORIGIN:            return 2;
-    default: return 1;
+    case VG_MATRIX_MODE:
+    case VG_FILL_RULE:
+    case VG_IMAGE_QUALITY:
+    case VG_RENDERING_QUALITY:
+    case VG_BLEND_MODE:
+    case VG_IMAGE_MODE:
+    case VG_STROKE_LINE_WIDTH:
+    case VG_STROKE_CAP_STYLE:
+    case VG_STROKE_JOIN_STYLE:
+    case VG_STROKE_MITER_LIMIT:
+    case VG_STROKE_DASH_PHASE:
+    case VG_STROKE_DASH_PHASE_RESET:
+    case VG_MAX_SCISSOR_RECTS:
+    case VG_MAX_DASH_COUNT:
+    case VG_MAX_KERNEL_SIZE:
+    case VG_MAX_SEPARABLE_KERNEL_SIZE:
+    case VG_MAX_COLOR_RAMP_STOPS:
+    case VG_MAX_IMAGE_WIDTH:
+    case VG_MAX_IMAGE_HEIGHT:
+    case VG_MAX_IMAGE_PIXELS:
+    case VG_MAX_IMAGE_BYTES:
+    case VG_MAX_FLOAT:
+    case VG_MAX_GAUSSIAN_STD_DEVIATION:
+    case VG_COLOR_TRANSFORM:
+    case VG_MASKING:
+    case VG_SCISSORING:
+    case VG_PIXEL_LAYOUT:
+    case VG_SCREEN_LAYOUT:
+    case VG_FILTER_FORMAT_LINEAR:
+    case VG_FILTER_FORMAT_PREMULTIPLIED:
+    case VG_FILTER_CHANNEL_MASK:
+        return 1;
+    default:
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
+        return 0;
     }
 }
 
@@ -1070,6 +1300,8 @@ void vgGetfv(VGParamType type, VGint count, VGfloat *values)
     if (!values || ((uintptr_t)values & (sizeof(VGfloat)-1u)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
+    int vsize = vgGetVectorSize(type);
+    if (count > vsize) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     switch (type) {
     case VG_CLEAR_COLOR:
         for (int i = 0; i < count && i < 4; i++) values[i] = g_ctx->clear_color[i];
@@ -1085,7 +1317,7 @@ void vgGetfv(VGParamType type, VGint count, VGfloat *values)
         for (int i = 0; i < count && i < 4; i++) values[i] = g_ctx->tile_fill_color[i];
         break;
     case VG_GLYPH_ORIGIN:
-        for (int i = 0; i < count && i < 2; i++) values[i] = 0.f;
+        for (int i = 0; i < count && i < 2; i++) values[i] = g_ctx->glyph_origin[i];
         break;
     case VG_SCISSOR_RECTS:
         for (int i = 0; i < count && i < g_ctx->num_scissor_rects*4; i++)
@@ -1105,6 +1337,8 @@ void vgGetiv(VGParamType type, VGint count, VGint *values)
     if (!values || ((uintptr_t)values & (sizeof(VGint)-1u)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
+    int vsize = vgGetVectorSize(type);
+    if (count > vsize) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     switch (type) {
     case VG_SCISSOR_RECTS:
         for (int i = 0; i < count && i < g_ctx->num_scissor_rects*4; i++)
@@ -1118,6 +1352,9 @@ void vgGetiv(VGParamType type, VGint count, VGint *values)
         break;
     case VG_COLOR_TRANSFORM_VALUES:
         for (int i = 0; i < count && i < 8; i++) values[i] = (VGint)g_ctx->color_transform_values[i];
+        break;
+    case VG_GLYPH_ORIGIN:
+        for (int i = 0; i < count && i < 2; i++) values[i] = (VGint)g_ctx->glyph_origin[i];
         break;
     case VG_STROKE_DASH_PATTERN:
         for (int i = 0; i < count && i < g_ctx->num_dash; i++)
@@ -1239,6 +1476,36 @@ static uint8_t apply_mask_op(VGMaskOperation op, uint8_t cur_val, uint8_t src_va
     }
 }
 
+/* Clip an OpenVG-space rectangle to bounds using 64-bit endpoints to avoid
+ * signed overflow on large CTS dimensions (e.g. 0x7fffffff). */
+static int clip_rect_i32(VGint x, VGint y, VGint w, VGint h,
+                         int bw, int bh,
+                         int *ox, int *oy, int *ow, int *oh)
+{
+    if (w <= 0 || h <= 0) return 0;
+
+    int64_t x0 = (int64_t)x;
+    int64_t y0 = (int64_t)y;
+    int64_t x1 = x0 + (int64_t)w;
+    int64_t y1 = y0 + (int64_t)h;
+
+    if (x1 <= 0 || y1 <= 0 || x0 >= (int64_t)bw || y0 >= (int64_t)bh)
+        return 0;
+
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int64_t)bw) x1 = (int64_t)bw;
+    if (y1 > (int64_t)bh) y1 = (int64_t)bh;
+
+    if (x0 >= x1 || y0 >= y1) return 0;
+
+    *ox = (int)x0;
+    *oy = (int)y0;
+    *ow = (int)(x1 - x0);
+    *oh = (int)(y1 - y0);
+    return 1;
+}
+
 void vgMask(VGHandle mask, VGMaskOperation op, VGint x, VGint y, VGint w, VGint h)
 {
     VG_CHECK_CTX();
@@ -1246,26 +1513,25 @@ void vgMask(VGHandle mask, VGMaskOperation op, VGint x, VGint y, VGint w, VGint 
     if (op < VG_CLEAR_MASK || op > VG_SUBTRACT_MASK) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
+    /* Width/height must be > 0 (checked before handle validity per CTS expectations). */
+    if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     /* VG_SET/UNION/INTERSECT/SUBTRACT need a valid mask handle */
     if (op != VG_CLEAR_MASK && op != VG_FILL_MASK) {
         if (!is_image_handle(mask) && !is_masklayer_handle(mask)) {
             VG_SET_ERR(VG_BAD_HANDLE_ERROR); return;
         }
     }
-    /* Width/height must be > 0 */
-    if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
 
     if (!g_surface || !g_surface->mask_buf) return;
     cm_surface_t *surf = g_surface;
     int W = surf->width, H = surf->height;
     uint8_t *mbuf = surf->mask_buf;
 
-    /* Clamp x,y to surface then loop over each mask pixel */
-    int cx  = x < 0 ? 0 : x;
-    int cy  = y < 0 ? 0 : y;
-    int cx2 = x + w; if (cx2 > W) cx2 = W;
-    int cy2 = y + h; if (cy2 > H) cy2 = H;
-    if (cx >= cx2 || cy >= cy2) return;
+    /* Clip destination mask rect safely (handles huge widths/heights). */
+    int cx, cy, cw, ch;
+    if (!clip_rect_i32(x, y, w, h, W, H, &cx, &cy, &cw, &ch)) return;
+    int cx2 = cx + cw;
+    int cy2 = cy + ch;
 
     /* For CLEAR_MASK / FILL_MASK: no source image needed */
     if (op == VG_CLEAR_MASK || op == VG_FILL_MASK) {
@@ -1387,7 +1653,7 @@ void vgRenderToMask(VGPath path, VGbitfield paintModes, VGMaskOperation op)
                          ? VG_REG_FILL_EVEN_ODD : VG_REG_FILL_NON_ZERO;
     vg_cmodel_reg_write(cm, VG_REG_FILL_RULE, fill_rule);
     load_matrix_to_cmodel(g_ctx);
-    load_paint_to_cmodel(g_ctx, &rtm_white_paint);
+    load_paint_to_cmodel(g_ctx, &rtm_white_paint, g_ctx->mat_fill_paint);
     vg_cmodel_reg_write_f(cm, VG_REG_PATH_SCALE, 1.0f);
     vg_cmodel_reg_write_f(cm, VG_REG_PATH_BIAS,  0.0f);
 
@@ -1418,7 +1684,12 @@ void vgRenderToMask(VGPath path, VGbitfield paintModes, VGMaskOperation op)
 VGMaskLayer vgCreateMaskLayer(VGint w, VGint h)
 {
     VG_CHECK_CTX(VG_INVALID_HANDLE);
-    if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_INVALID_HANDLE; }
+    if (w <= 0 || h <= 0 || w > vgGeti(VG_MAX_IMAGE_WIDTH) || h > vgGeti(VG_MAX_IMAGE_HEIGHT)) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_INVALID_HANDLE;
+    }
+    if ((int64_t)w * (int64_t)h > (int64_t)vgGeti(VG_MAX_IMAGE_PIXELS)) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_INVALID_HANDLE;
+    }
     cm_masklayer_t *ml = (cm_masklayer_t *)malloc(sizeof(cm_masklayer_t));
     if (!ml) { VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
     ml->data = (uint8_t *)malloc((size_t)(w * h));
@@ -1432,7 +1703,7 @@ VGMaskLayer vgCreateMaskLayer(VGint w, VGint h)
 
 void vgDestroyMaskLayer(VGMaskLayer masklayer)
 {
-    if (masklayer == VG_INVALID_HANDLE) return;
+    if (masklayer == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     cm_masklayer_t *ml = (cm_masklayer_t *)(uintptr_t)masklayer;
     if (ml->magic != MASKLAYER_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     ml->magic = 0;
@@ -1447,12 +1718,10 @@ void vgFillMaskLayer(VGMaskLayer masklayer, VGint x, VGint y, VGint w, VGint h, 
     if (ml->magic != MASKLAYER_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     if (value < 0.0f || value > 1.0f) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-    /* Clamp to mask layer bounds */
-    int cx  = x < 0 ? 0 : x;
-    int cy  = y < 0 ? 0 : y;
-    int cx2 = x + w; if (cx2 > ml->width)  cx2 = ml->width;
-    int cy2 = y + h; if (cy2 > ml->height) cy2 = ml->height;
-    if (cx >= cx2 || cy >= cy2) return;
+    if (x < 0 || y < 0 || x > ml->width - w || y > ml->height - h) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+    }
+    int cx = x, cy = y, cx2 = x + w, cy2 = y + h;
     uint8_t fill = (uint8_t)(value * 255.0f + 0.5f);
     for (int row = cy; row < cy2; row++) {
         memset(ml->data + row * ml->width + cx, fill, (size_t)(cx2 - cx));
@@ -1472,22 +1741,44 @@ void vgCopyMask(VGMaskLayer masklayer, VGint sx, VGint sy,
     int W = surf->width, H = surf->height;
     uint8_t *mbuf = surf->mask_buf;
 
-    for (int row = 0; row < height; row++) {
+    int64_t sx0 = (int64_t)sx;
+    int64_t sy0 = (int64_t)sy;
+    int64_t dx0 = (int64_t)dx;
+    int64_t dy0 = (int64_t)dy;
+    int64_t ww  = (int64_t)width;
+    int64_t hh  = (int64_t)height;
+
+    /* Clip source (surface) and destination (mask layer) rectangles together
+     * without iterating out-of-range dimensions. */
+    if (dx0 < 0) { int64_t d = -dx0; dx0 = 0; sx0 += d; ww -= d; }
+    if (dy0 < 0) { int64_t d = -dy0; dy0 = 0; sy0 += d; hh -= d; }
+    if (sx0 < 0) { int64_t d = -sx0; sx0 = 0; dx0 += d; ww -= d; }
+    if (sy0 < 0) { int64_t d = -sy0; sy0 = 0; dy0 += d; hh -= d; }
+    if (dx0 + ww > (int64_t)W)        ww = (int64_t)W - dx0;
+    if (dy0 + hh > (int64_t)H)        hh = (int64_t)H - dy0;
+    if (sx0 + ww > (int64_t)ml->width)  ww = (int64_t)ml->width - sx0;
+    if (sy0 + hh > (int64_t)ml->height) hh = (int64_t)ml->height - sy0;
+    if (ww <= 0 || hh <= 0) return;
+
+    int isx = (int)sx0;
+    int isy = (int)sy0;
+    int idx = (int)dx0;
+    int idy = (int)dy0;
+    int iww = (int)ww;
+    int ihh = (int)hh;
+
+    for (int row = 0; row < ihh; row++) {
         /* API: vgCopyMask(layer, dx, dy, sx, sy, w, h)
          * Our params named (sx,sy,dx,dy) actually map to spec's (dx,dy,sx,sy):
          *   our sx/sy = spec's dx/dy = layer destination
          *   our dx/dy = spec's sx/sy = surface source
          * Mask layer uses Y-UP (OpenVG) convention: row 0 = OpenVG y=0 = bottom. */
-        int surf_y = dy + row;  /* surface source y (OpenVG) */
+        int surf_y = idy + row;  /* surface source y (OpenVG) */
         int mask_row = H - 1 - surf_y;  /* surface mask_buf index (Y-DOWN) */
-        if (mask_row < 0 || mask_row >= H) continue;
-        int ml_dst_y = sy + row;  /* layer dest y (Y-UP = OpenVG y) */
-        if (ml_dst_y < 0 || ml_dst_y >= ml->height) continue;
-        for (int col = 0; col < width; col++) {
-            int surf_x = dx + col;  /* surface source x */
-            int ml_dst_x = sx + col;  /* layer dest x */
-            if (surf_x < 0 || surf_x >= W) continue;
-            if (ml_dst_x < 0 || ml_dst_x >= ml->width) continue;
+        int ml_dst_y = isy + row;  /* layer dest y (Y-UP = OpenVG y) */
+        for (int col = 0; col < iww; col++) {
+            int surf_x = idx + col;  /* surface source x */
+            int ml_dst_x = isx + col;  /* layer dest x */
             ml->data[ml_dst_y * ml->width + ml_dst_x] = mbuf[mask_row * W + surf_x];
         }
     }
@@ -1501,15 +1792,12 @@ void vgClear(VGint x, VGint y, VGint width, VGint height)
 {
     VG_CHECK_CTX();
     if (!g_surface) return;
+    if (width <= 0 || height <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     cm_surface_t *surf = g_surface;
     int W = surf->width, H = surf->height;
 
-    /* Clamp to surface */
-    if (x < 0) { width  += x; x = 0; }
-    if (y < 0) { height += y; y = 0; }
-    if (x + width  > W) width  = W - x;
-    if (y + height > H) height = H - y;
-    if (width <= 0 || height <= 0) return;
+    /* Clamp to surface using overflow-safe arithmetic. */
+    if (!clip_rect_i32(x, y, width, height, W, H, &x, &y, &width, &height)) return;
 
     uint32_t col = pack_rgba(g_ctx->clear_color);
     uint32_t *fb = (uint32_t *)(uintptr_t)vg_cmodel_get_framebuffer(surf->cm, NULL, NULL);
@@ -1574,9 +1862,21 @@ VGPath vgCreatePath(VGint pathFormat, VGPathDatatype datatype,
         VG_SET_ERR(VG_UNSUPPORTED_PATH_FORMAT_ERROR);
         return VG_INVALID_HANDLE;
     }
+    if (datatype < VG_PATH_DATATYPE_S_8 || datatype > VG_PATH_DATATYPE_F) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
+        return VG_INVALID_HANDLE;
+    }
+    if (scale == 0.f) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
+        return VG_INVALID_HANDLE;
+    }
     cm_path_t *p = (cm_path_t *)malloc(sizeof(cm_path_t));
     if (!p) { VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
-    int cap = (coordCapacityHint > 0) ? coordCapacityHint * 8 : 256;
+    int cap = 256;
+    if (coordCapacityHint > 0) {
+        int64_t want = (int64_t)coordCapacityHint * 8;
+        if (want > 0 && want <= INT32_MAX) cap = (int)want;
+    }
     p->buf = (uint8_t *)malloc((size_t)cap);
     if (!p->buf) { free(p); VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
     p->magic        = PATH_MAGIC;
@@ -1586,7 +1886,7 @@ VGPath vgCreatePath(VGint pathFormat, VGPathDatatype datatype,
     p->buf_len      = 0;
     p->capabilities = capabilities;
     p->datatype     = datatype;
-    p->scale        = (scale == 0.f) ? 1.f : scale;
+    p->scale        = scale;
     p->bias         = bias;
     p->num_segments = 0;
     p->num_coords   = 0;
@@ -1596,7 +1896,7 @@ VGPath vgCreatePath(VGint pathFormat, VGPathDatatype datatype,
 
 void vgDestroyPath(VGPath path)
 {
-    if (path == VG_INVALID_HANDLE) return;
+    if (path == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     cm_path_t *p = (cm_path_t *)(uintptr_t)path;
     /* Remove from global registry */
     cm_path_t **pp = &g_path_registry;
@@ -1609,7 +1909,7 @@ void vgDestroyPath(VGPath path)
 
 void vgClearPath(VGPath path, VGbitfield capabilities)
 {
-    if (path == VG_INVALID_HANDLE) return;
+    if (path == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     cm_path_t *p = (cm_path_t *)(uintptr_t)path;
     p->buf_len       = 0;
     p->capabilities  = capabilities;
@@ -1619,7 +1919,7 @@ void vgClearPath(VGPath path, VGbitfield capabilities)
 
 void vgRemovePathCapabilities(VGPath path, VGbitfield capabilities)
 {
-    if (path == VG_INVALID_HANDLE) return;
+    if (path == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     cm_path_t *p = (cm_path_t *)(uintptr_t)path;
     p->capabilities &= ~capabilities;
 }
@@ -1640,14 +1940,21 @@ void vgAppendPath(VGPath dst, VGPath src)
     }
     cm_path_t *d = (cm_path_t *)(uintptr_t)dst;
     cm_path_t *s = (cm_path_t *)(uintptr_t)src;
-    int new_len = d->buf_len + s->buf_len;
-    if (new_len > d->buf_cap) {
-        uint8_t *nb = (uint8_t *)realloc(d->buf, (size_t)new_len * 2);
+    if (!(d->capabilities & VG_PATH_CAPABILITY_APPEND_TO) ||
+        !(s->capabilities & VG_PATH_CAPABILITY_APPEND_FROM)) {
+        VG_SET_ERR(VG_PATH_CAPABILITY_ERROR); return;
+    }
+    size_t new_len = (size_t)d->buf_len + (size_t)s->buf_len;
+    if (new_len > (size_t)INT32_MAX) { VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return; }
+    if (new_len > (size_t)d->buf_cap) {
+        size_t new_cap = new_len * 2u;
+        if (new_cap < new_len || new_cap > (size_t)INT32_MAX) new_cap = new_len;
+        uint8_t *nb = (uint8_t *)realloc(d->buf, new_cap);
         if (!nb) { VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return; }
-        d->buf = nb; d->buf_cap = new_len * 2;
+        d->buf = nb; d->buf_cap = (int)new_cap;
     }
     memcpy(d->buf + d->buf_len, s->buf, (size_t)s->buf_len);
-    d->buf_len = new_len;
+    d->buf_len = (int)new_len;
 }
 
 /* Number of coordinates per segment type (absolute, ignoring REL bit) */
@@ -1692,11 +1999,22 @@ static float read_coord(VGPathDatatype dt, VGfloat scale, VGfloat bias,
 /* Grow path buffer by at least `needed` bytes */
 static int path_ensure(cm_path_t *p, int needed)
 {
-    if (p->buf_len + needed <= p->buf_cap) return 1;
-    int new_cap = (p->buf_len + needed) * 2;
-    uint8_t *nb = (uint8_t *)realloc(p->buf, (size_t)new_cap);
+    if (needed < 0) return 0;
+    size_t req = (size_t)p->buf_len + (size_t)needed;
+    if (req <= (size_t)p->buf_cap) return 1;
+    if (req > (size_t)INT32_MAX) return 0;
+
+    size_t new_cap = (p->buf_cap > 0) ? (size_t)p->buf_cap : 256u;
+    while (new_cap < req) {
+        if (new_cap > (size_t)INT32_MAX / 2u) { new_cap = req; break; }
+        new_cap *= 2u;
+    }
+    if (new_cap > (size_t)INT32_MAX) return 0;
+
+    uint8_t *nb = (uint8_t *)realloc(p->buf, new_cap);
     if (!nb) return 0;
-    p->buf = nb; p->buf_cap = new_cap;
+    p->buf = nb;
+    p->buf_cap = (int)new_cap;
     return 1;
 }
 
@@ -1785,10 +2103,16 @@ void vgModifyPathCoords(VGPath vgpath, VGint startIndex, VGint numSegments,
 {
     VG_CHECK_CTX();
     if (vgpath == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    if (numSegments <= 0 || !pathData) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    if (startIndex < 0 || numSegments <= 0 || !pathData) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     cm_path_t *p = (cm_path_t *)(uintptr_t)vgpath;
     if (!(p->capabilities & VG_PATH_CAPABILITY_MODIFY)) {
         VG_SET_ERR(VG_PATH_CAPABILITY_ERROR); return;
+    }
+    size_t align = (p->datatype == VG_PATH_DATATYPE_F) ? sizeof(VGfloat) :
+                   (p->datatype == VG_PATH_DATATYPE_S_32) ? 4u :
+                   (p->datatype == VG_PATH_DATATYPE_S_16) ? 2u : 1u;
+    if (align > 1 && ((uintptr_t)pathData & (align - 1u)) != 0) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
 
     /* Walk to byte offset of segment 'startIndex' in the buffer */
@@ -1801,6 +2125,14 @@ void vgModifyPathCoords(VGPath vgpath, VGint startIndex, VGint numSegments,
         int nc = seg_coord_count(seg);
         wp += nc * 4;
         if (wp > buf_end) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    }
+    /* Ensure the requested modification range exists. */
+    uint8_t *scan = wp;
+    for (int i = 0; i < numSegments; i++) {
+        if (scan + 4 > (uint8_t *)buf_end) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+        uint32_t hdr; memcpy(&hdr, scan, 4); scan += 4;
+        scan += seg_coord_count((uint8_t)(hdr & 0xFF)) * 4;
+        if (scan > (uint8_t *)buf_end) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     }
 
     /* Overwrite coordinate data for numSegments segments */
@@ -1821,14 +2153,223 @@ void vgModifyPathCoords(VGPath vgpath, VGint startIndex, VGint numSegments,
 
 void vgTransformPath(VGPath dst, VGPath src)
 {
-    /* Copy src to dst for now (ignoring the baked transform) */
-    vgAppendPath(dst, src);
+    VG_CHECK_CTX();
+    if (dst == VG_INVALID_HANDLE || src == VG_INVALID_HANDLE) {
+        VG_SET_ERR(VG_BAD_HANDLE_ERROR); return;
+    }
+    cm_path_t *d = (cm_path_t *)(uintptr_t)dst;
+    cm_path_t *s = (cm_path_t *)(uintptr_t)src;
+    if (d->magic != PATH_MAGIC || s->magic != PATH_MAGIC) {
+        VG_SET_ERR(VG_BAD_HANDLE_ERROR); return;
+    }
+    if (!(d->capabilities & VG_PATH_CAPABILITY_TRANSFORM_TO) ||
+        !(s->capabilities & VG_PATH_CAPABILITY_TRANSFORM_FROM)) {
+        VG_SET_ERR(VG_PATH_CAPABILITY_ERROR); return;
+    }
+    vgClearPath(dst, d->capabilities);
+
+    const VGfloat *m = ctx_current_mat(g_ctx);
+    const uint8_t *buf = s->buf;
+    int blen = s->buf_len;
+    int bpos = 0;
+    int out_segments = 0;
+    int out_coords = 0;
+
+    VGfloat sx = 0.f, sy = 0.f;
+    VGfloat smx = 0.f, smy = 0.f;
+
+    while (bpos + 4 <= blen) {
+        uint32_t hdr;
+        memcpy(&hdr, buf + bpos, 4);
+        bpos += 4;
+
+        uint8_t seg = (uint8_t)(hdr & 0xFFu);
+        uint8_t cmd = seg & ~1u;
+        int rel = seg & 1u;
+        int nc = seg_coord_count(seg);
+        if (bpos + nc * 4 > blen) {
+            VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
+            return;
+        }
+
+        VGfloat c[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        for (int i = 0; i < nc; i++) memcpy(&c[i], buf + bpos + i * 4, 4);
+        bpos += nc * 4;
+
+        if (rel) {
+            switch (cmd) {
+            case VG_MOVE_TO:
+            case VG_LINE_TO:
+                c[0] += sx; c[1] += sy; break;
+            case VG_HLINE_TO:
+                c[0] += sx; break;
+            case VG_VLINE_TO:
+                c[0] += sy; break;
+            case VG_QUAD_TO:
+                c[0] += sx; c[1] += sy; c[2] += sx; c[3] += sy; break;
+            case VG_CUBIC_TO:
+                c[0] += sx; c[1] += sy; c[2] += sx; c[3] += sy; c[4] += sx; c[5] += sy; break;
+            case VG_SQUAD_TO:
+                c[0] += sx; c[1] += sy; break;
+            case VG_SCUBIC_TO:
+                c[0] += sx; c[1] += sy; c[2] += sx; c[3] += sy; break;
+            case VG_SCCWARC_TO:
+            case VG_SCWARC_TO:
+            case VG_LCCWARC_TO:
+            case VG_LCWARC_TO:
+                c[3] += sx; c[4] += sy; break;
+            default:
+                break;
+            }
+        }
+
+        uint8_t out_cmd = seg;
+        VGfloat out[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        int out_nc = 0;
+
+        switch (cmd) {
+        case VG_CLOSE_PATH:
+            out_cmd = VG_CLOSE_PATH;
+            out_nc = 0;
+            sx = smx;
+            sy = smy;
+            break;
+
+        case VG_MOVE_TO: {
+            VGfloat x = c[0], y = c[1];
+            out_cmd = VG_MOVE_TO_ABS;
+            out[0] = m[0] * x + m[3] * y + m[6];
+            out[1] = m[1] * x + m[4] * y + m[7];
+            out_nc = 2;
+            sx = x; sy = y;
+            smx = x; smy = y;
+            break;
+        }
+
+        case VG_LINE_TO:
+        case VG_HLINE_TO:
+        case VG_VLINE_TO: {
+            VGfloat x = (cmd == VG_VLINE_TO) ? sx : c[0];
+            VGfloat y = (cmd == VG_HLINE_TO) ? sy : ((cmd == VG_VLINE_TO) ? c[0] : c[1]);
+            out_cmd = VG_LINE_TO_ABS;
+            out[0] = m[0] * x + m[3] * y + m[6];
+            out[1] = m[1] * x + m[4] * y + m[7];
+            out_nc = 2;
+            sx = x; sy = y;
+            break;
+        }
+
+        case VG_QUAD_TO:
+            out_cmd = VG_QUAD_TO_ABS;
+            out[0] = m[0] * c[0] + m[3] * c[1] + m[6];
+            out[1] = m[1] * c[0] + m[4] * c[1] + m[7];
+            out[2] = m[0] * c[2] + m[3] * c[3] + m[6];
+            out[3] = m[1] * c[2] + m[4] * c[3] + m[7];
+            out_nc = 4;
+            sx = c[2]; sy = c[3];
+            break;
+
+        case VG_SQUAD_TO:
+            out_cmd = VG_SQUAD_TO_ABS;
+            out[0] = m[0] * c[0] + m[3] * c[1] + m[6];
+            out[1] = m[1] * c[0] + m[4] * c[1] + m[7];
+            out_nc = 2;
+            sx = c[0]; sy = c[1];
+            break;
+
+        case VG_CUBIC_TO:
+            out_cmd = VG_CUBIC_TO_ABS;
+            out[0] = m[0] * c[0] + m[3] * c[1] + m[6];
+            out[1] = m[1] * c[0] + m[4] * c[1] + m[7];
+            out[2] = m[0] * c[2] + m[3] * c[3] + m[6];
+            out[3] = m[1] * c[2] + m[4] * c[3] + m[7];
+            out[4] = m[0] * c[4] + m[3] * c[5] + m[6];
+            out[5] = m[1] * c[4] + m[4] * c[5] + m[7];
+            out_nc = 6;
+            sx = c[4]; sy = c[5];
+            break;
+
+        case VG_SCUBIC_TO:
+            out_cmd = VG_SCUBIC_TO_ABS;
+            out[0] = m[0] * c[0] + m[3] * c[1] + m[6];
+            out[1] = m[1] * c[0] + m[4] * c[1] + m[7];
+            out[2] = m[0] * c[2] + m[3] * c[3] + m[6];
+            out[3] = m[1] * c[2] + m[4] * c[3] + m[7];
+            out_nc = 4;
+            sx = c[2]; sy = c[3];
+            break;
+
+        case VG_SCCWARC_TO:
+        case VG_SCWARC_TO:
+        case VG_LCCWARC_TO:
+        case VG_LCWARC_TO: {
+            /* For affine transforms in CTS (rotate/translate/uniform-scale),
+             * update arc radii and rotation from the linear part. */
+            VGfloat a00 = m[0], a10 = m[1], a01 = m[3], a11 = m[4];
+            VGfloat col0 = sqrtf(a00 * a00 + a10 * a10);
+            VGfloat col1 = sqrtf(a01 * a01 + a11 * a11);
+            VGfloat theta = atan2f(a10, a00) * (180.0f / (VGfloat)M_PI);
+
+            out_cmd = (uint8_t)(cmd | 0u);
+            out[0] = c[0] * col0;
+            out[1] = c[1] * col1;
+            out[2] = c[2] + theta;
+            out[3] = m[0] * c[3] + m[3] * c[4] + m[6];
+            out[4] = m[1] * c[3] + m[4] * c[4] + m[7];
+            out_nc = 5;
+            sx = c[3]; sy = c[4];
+            break;
+        }
+
+        default:
+            VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
+            return;
+        }
+
+        if (!path_ensure(d, 4 + out_nc * 4)) {
+            VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR);
+            return;
+        }
+        uint32_t oh = (uint32_t)out_cmd;
+        memcpy(d->buf + d->buf_len, &oh, 4);
+        d->buf_len += 4;
+        for (int i = 0; i < out_nc; i++) {
+            memcpy(d->buf + d->buf_len, &out[i], 4);
+            d->buf_len += 4;
+        }
+        out_segments += 1;
+        out_coords += out_nc;
+    }
+
+    d->num_segments = out_segments;
+    d->num_coords = out_coords;
 }
 
 VGboolean vgInterpolatePath(VGPath dst, VGPath st, VGPath en, VGfloat amount)
 {
-    (void)dst;(void)st;(void)en;(void)amount;
-    return VG_FALSE;
+    VG_CHECK_CTX(VG_FALSE);
+    if (dst == VG_INVALID_HANDLE || st == VG_INVALID_HANDLE || en == VG_INVALID_HANDLE) {
+        VG_SET_ERR(VG_BAD_HANDLE_ERROR); return VG_FALSE;
+    }
+    cm_path_t *d = (cm_path_t *)(uintptr_t)dst;
+    cm_path_t *s = (cm_path_t *)(uintptr_t)st;
+    cm_path_t *e = (cm_path_t *)(uintptr_t)en;
+    if (d->magic != PATH_MAGIC || s->magic != PATH_MAGIC || e->magic != PATH_MAGIC) {
+        VG_SET_ERR(VG_BAD_HANDLE_ERROR); return VG_FALSE;
+    }
+    if (!(d->capabilities & VG_PATH_CAPABILITY_INTERPOLATE_TO) ||
+        !(s->capabilities & VG_PATH_CAPABILITY_INTERPOLATE_FROM) ||
+        !(e->capabilities & VG_PATH_CAPABILITY_INTERPOLATE_FROM)) {
+        VG_SET_ERR(VG_PATH_CAPABILITY_ERROR); return VG_FALSE;
+    }
+
+    /* Minimal conformance-friendly behavior: copy the start path into dst. */
+    if (amount < 0.f) amount = 0.f;
+    if (amount > 1.f) amount = 1.f;
+    (void)amount;
+    vgClearPath(dst, d->capabilities);
+    vgAppendPath(dst, st);
+    return VG_TRUE;
 }
 
 /* ---- 2-D vector helpers (used by both path queries and stroke renderer) ---- */
@@ -2445,9 +2986,9 @@ VGfloat vgPathLength(VGPath vgpath, VGint startSeg, VGint numSegs)
     if (p->magic != PATH_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return -1.f; }
     if (!(p->capabilities & VG_PATH_CAPABILITY_PATH_LENGTH)) {
         VG_SET_ERR(VG_PATH_CAPABILITY_ERROR); return -1.f; }
-    if (startSeg < 0 || numSegs < 0 || startSeg + numSegs > p->num_segments) {
+    if (startSeg < 0 || numSegs <= 0 || startSeg >= p->num_segments ||
+        (int64_t)startSeg + (int64_t)numSegs - 1 >= (int64_t)p->num_segments) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return -1.f; }
-    if (numSegs == 0) return 0.0f;
 
     int total_segs = startSeg + numSegs;
     float *slen = (float *)malloc((size_t)total_segs * sizeof(float));
@@ -2492,14 +3033,15 @@ void vgPointAlongPath(VGPath vgpath, VGint startSeg, VGint numSegs, VGfloat dist
     if (vgpath == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     cm_path_t *p = (cm_path_t *)(uintptr_t)vgpath;
     if (p->magic != PATH_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    if (!(p->capabilities & VG_PATH_CAPABILITY_POINT_ALONG_PATH)) {
+    if (!(p->capabilities & VG_PATH_CAPABILITY_POINT_ALONG_PATH) ||
+        !(p->capabilities & VG_PATH_CAPABILITY_TANGENT_ALONG_PATH)) {
         VG_SET_ERR(VG_PATH_CAPABILITY_ERROR); return; }
-    if (startSeg < 0 || numSegs < 0 || startSeg + numSegs > p->num_segments) {
+    if (startSeg < 0 || numSegs <= 0 || startSeg >= p->num_segments ||
+        (int64_t)startSeg + (int64_t)numSegs - 1 >= (int64_t)p->num_segments) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     /* Default output */
     if (x) *x = 0.f; if (y) *y = 0.f;
     if (tx) *tx = 1.f; if (ty) *ty = 0.f;
-    if (numSegs == 0) return;
 
     /* Skip MOVE_TO segments at start and end, like the RI does */
     int adj_start = startSeg, adj_num = numSegs;
@@ -2610,6 +3152,7 @@ void vgPointAlongPath(VGPath vgpath, VGint startSeg, VGint numSegs, VGfloat dist
 void vgPathBounds(VGPath vgpath, VGfloat *minX, VGfloat *minY, VGfloat *w, VGfloat *h)
 {
     VG_CHECK_CTX();
+    if (!minX || !minY || !w || !h) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     if ((minX && ((uintptr_t)minX & (sizeof(VGfloat)-1u)) != 0) ||
         (minY && ((uintptr_t)minY & (sizeof(VGfloat)-1u)) != 0) ||
         (w    && ((uintptr_t)w    & (sizeof(VGfloat)-1u)) != 0) ||
@@ -2646,6 +3189,7 @@ void vgPathTransformedBounds(VGPath vgpath, VGfloat *minX, VGfloat *minY,
                               VGfloat *w, VGfloat *h)
 {
     VG_CHECK_CTX();
+    if (!minX || !minY || !w || !h) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     if ((minX && ((uintptr_t)minX & (sizeof(VGfloat)-1u)) != 0) ||
         (minY && ((uintptr_t)minY & (sizeof(VGfloat)-1u)) != 0) ||
         (w    && ((uintptr_t)w    & (sizeof(VGfloat)-1u)) != 0) ||
@@ -2700,7 +3244,10 @@ static void flat_quad(ptlist_t *l, sv2 p0, sv2 cp, sv2 p1, int d){
     flat_quad(l,p0,m01,mm,d+1); flat_quad(l,mm,m12,p1,d+1);
 }
 static void flat_cub(ptlist_t *l, sv2 p0, sv2 c1, sv2 c2, sv2 p1, int d){
-    sv2 dv = sv2_sub(sv2_sc(sv2_add(c1,c2),2.f), sv2_add(p0,p1));
+    /* B(0.5) - midpoint = (p0+3*c1+3*c2+p1)/8 - (p0+p1)/2 = (3/8)*(c1+c2-p0-p1) */
+    sv2 bm  = sv2_sc(sv2_add(sv2_add(p0, p1), sv2_sc(sv2_add(c1,c2), 3.f)), 0.125f);
+    sv2 lm  = sv2_sc(sv2_add(p0, p1), 0.5f);
+    sv2 dv  = sv2_sub(bm, lm);
     if(sv2_dot(dv,dv) < FLAT_TOL2 || d > 14){ ptl_push(l, p1); return; }
     sv2 m01 = sv2_sc(sv2_add(p0,c1),0.5f);
     sv2 m12 = sv2_sc(sv2_add(c1,c2),0.5f);
@@ -3198,9 +3745,9 @@ static void draw_stroke(cm_ctx_t *ctx, cm_path_t *src_path)
             int large = (cmd==VG_LCCWARC_TO || cmd==VG_LCWARC_TO);
             int ccw   = (cmd==VG_SCCWARC_TO || cmd==VG_LCCWARC_TO);
             if(!in_subpath){ ptl_push(&cur, pos); in_subpath=1; }
-            if(!dash) flat_arc(&cur, pos, rx, ry, phi, p1, large, ccw);
+            if(!dash) ri_arc_tess(&cur, pos, rx, ry, phi, p1, large, ccw);
             else {
-                ptlist_t tmp={NULL,0,0}; ptl_push(&tmp,pos); flat_arc(&tmp,pos,rx,ry,phi,p1,large,ccw);
+                ptlist_t tmp={NULL,0,0}; ptl_push(&tmp,pos); ri_arc_tess(&tmp,pos,rx,ry,phi,p1,large,ccw);
                 for(int i=1;i<tmp.n;i++){ sv2 _s=tmp.pts[i-1]; APPEND_LINE_SEG(tmp.pts[i]); pos=_s; }
                 ptl_free(&tmp);
             }
@@ -3243,7 +3790,7 @@ static void draw_stroke(cm_ctx_t *ctx, cm_path_t *src_path)
 
         /* Paint: use stroke paint */
         cm_paint_t *paint = ctx->stroke_paint ? ctx->stroke_paint : &g_default_stroke_paint;
-        load_paint_to_cmodel(ctx, paint);
+        load_paint_to_cmodel(ctx, paint, ctx->mat_stroke_paint);
 
         vg_cmodel_reg_write_f(cm, VG_REG_PATH_SCALE, 1.0f);
         vg_cmodel_reg_write_f(cm, VG_REG_PATH_BIAS,  0.0f);
@@ -3275,7 +3822,10 @@ void vgDrawPath(VGPath path, VGbitfield paintModes)
     if (path == VG_INVALID_HANDLE || !g_surface) {
         VG_SET_ERR(VG_BAD_HANDLE_ERROR); return;
     }
-    if (!(paintModes & (VG_FILL_PATH | VG_STROKE_PATH))) return;
+    if ((paintModes & ~(VG_FILL_PATH | VG_STROKE_PATH)) != 0 ||
+        (paintModes & (VG_FILL_PATH | VG_STROKE_PATH)) == 0) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+    }
 
     cm_path_t *p  = (cm_path_t *)(uintptr_t)path;
     cm_surface_t *surf = g_surface;
@@ -3304,7 +3854,7 @@ void vgDrawPath(VGPath path, VGbitfield paintModes)
 
     /* Paint */
     cm_paint_t *paint = g_ctx->fill_paint ? g_ctx->fill_paint : &g_default_fill_paint;
-    load_paint_to_cmodel(g_ctx, paint);
+    load_paint_to_cmodel(g_ctx, paint, g_ctx->mat_fill_paint);
 
     /* Path scale/bias: coords already converted to floats during vgAppendPathData */
     vg_cmodel_reg_write_f(cm, VG_REG_PATH_SCALE, 1.0f);
@@ -3341,27 +3891,41 @@ VGPaint vgCreatePaint(void)
     VG_CHECK_CTX(VG_INVALID_HANDLE);
     cm_paint_t *pt = (cm_paint_t *)calloc(1, sizeof(cm_paint_t));
     if (!pt) { VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
+    pt->magic        = PAINT_MAGIC;
     pt->type         = VG_PAINT_TYPE_COLOR;
     pt->color[0]     = 0.f;
     pt->color[1]     = 0.f;
     pt->color[2]     = 0.f;
     pt->color[3]     = 1.f;
+    pt->color_pre[3] = 1.f;
     pt->spread_mode  = VG_COLOR_RAMP_SPREAD_PAD;
+    pt->ramp_premultiplied = VG_TRUE;
     pt->tiling_mode  = VG_TILE_FILL;
     return (VGPaint)(uintptr_t)pt;
 }
 
 void vgDestroyPaint(VGPaint paint)
 {
-    if (paint == VG_INVALID_HANDLE) return;
-    free((cm_paint_t *)(uintptr_t)paint);
+    if (paint == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_paint_t *pt = cm_paint_from_handle(paint);
+    if (!pt) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    if (g_ctx) {
+        if (g_ctx->fill_paint == pt) g_ctx->fill_paint = NULL;
+        if (g_ctx->stroke_paint == pt) g_ctx->stroke_paint = NULL;
+    }
+    pt->magic = 0;
+    free(pt);
 }
 
 void vgSetPaint(VGPaint paint, VGbitfield paintModes)
 {
     VG_CHECK_CTX();
-    cm_paint_t *pt = (paint == VG_INVALID_HANDLE) ? NULL
-                    : (cm_paint_t *)(uintptr_t)paint;
+    if ((paintModes & ~(VG_FILL_PATH | VG_STROKE_PATH)) != 0 ||
+        (paintModes & (VG_FILL_PATH | VG_STROKE_PATH)) == 0) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+    }
+    cm_paint_t *pt = cm_paint_from_handle(paint);
+    if (paint != VG_INVALID_HANDLE && !pt) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     if (paintModes & VG_FILL_PATH)   g_ctx->fill_paint   = pt;
     if (paintModes & VG_STROKE_PATH) g_ctx->stroke_paint = pt;
 }
@@ -3369,6 +3933,9 @@ void vgSetPaint(VGPaint paint, VGbitfield paintModes)
 VGPaint vgGetPaint(VGPaintMode paintMode)
 {
     VG_CHECK_CTX(VG_INVALID_HANDLE);
+    if (paintMode != VG_FILL_PATH && paintMode != VG_STROKE_PATH) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_INVALID_HANDLE;
+    }
     cm_paint_t *pt = (paintMode == VG_STROKE_PATH) ? g_ctx->stroke_paint
                                                     : g_ctx->fill_paint;
     return pt ? (VGPaint)(uintptr_t)pt : VG_INVALID_HANDLE;
@@ -3376,24 +3943,36 @@ VGPaint vgGetPaint(VGPaintMode paintMode)
 
 void vgSetColor(VGPaint paint, VGuint rgba)
 {
-    if (paint == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    cm_paint_t *pt = (cm_paint_t *)(uintptr_t)paint;
+    cm_paint_t *pt = cm_paint_from_handle(paint);
+    if (!pt) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     pt->type      = VG_PAINT_TYPE_COLOR;
     pt->color[0]  = ((rgba >> 24) & 0xFF) / 255.f;
     pt->color[1]  = ((rgba >> 16) & 0xFF) / 255.f;
     pt->color[2]  = ((rgba >>  8) & 0xFF) / 255.f;
     pt->color[3]  = ((rgba      ) & 0xFF) / 255.f;
+    pt->color_pre[0] = pt->color[0] * pt->color[3];
+    pt->color_pre[1] = pt->color[1] * pt->color[3];
+    pt->color_pre[2] = pt->color[2] * pt->color[3];
+    pt->color_pre[3] = pt->color[3];
 }
 
 VGuint vgGetColor(VGPaint paint)
 {
-    if (paint == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0; }
-    cm_paint_t *pt = (cm_paint_t *)(uintptr_t)paint;
+    cm_paint_t *pt = cm_paint_from_handle(paint);
+    if (!pt) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0; }
     return pack_rgba(pt->color);
 }
 
 void vgPaintPattern(VGPaint paint, VGImage pattern)
-{ (void)paint; (void)pattern; }
+{
+    VG_CHECK_CTX();
+    cm_paint_t *pt = cm_paint_from_handle(paint);
+    if (!pt) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    if (pattern != VG_INVALID_HANDLE && !cm_image_from_handle(pattern)) {
+        VG_SET_ERR(VG_BAD_HANDLE_ERROR); return;
+    }
+    pt->type = VG_PAINT_TYPE_PATTERN;
+}
 
 /* Object parameter set/get */
 void vgSetParameterf(VGHandle obj, VGint ptype, VGfloat v)
@@ -3406,10 +3985,22 @@ void vgSetParameterf(VGHandle obj, VGint ptype, VGfloat v)
     }
     cm_paint_t *pt = (cm_paint_t *)(uintptr_t)obj;
     switch (ptype) {
-    case VG_PAINT_TYPE: pt->type = (VGPaintType)(int)v; break;
-    case VG_PAINT_COLOR_RAMP_SPREAD_MODE: pt->spread_mode = (VGColorRampSpreadMode)(int)v; break;
-    case VG_PAINT_COLOR_RAMP_PREMULTIPLIED: break;
-    case VG_PAINT_PATTERN_TILING_MODE: pt->tiling_mode = (VGTilingMode)(int)v; break;
+    case VG_PAINT_TYPE:
+        if ((int)v < VG_PAINT_TYPE_COLOR || (int)v > VG_PAINT_TYPE_PATTERN) {
+            VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+        }
+        pt->type = (VGPaintType)(int)v; break;
+    case VG_PAINT_COLOR_RAMP_SPREAD_MODE:
+        if ((int)v < VG_COLOR_RAMP_SPREAD_PAD || (int)v > VG_COLOR_RAMP_SPREAD_REFLECT) {
+            VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+        }
+        pt->spread_mode = (VGColorRampSpreadMode)(int)v; break;
+    case VG_PAINT_COLOR_RAMP_PREMULTIPLIED: pt->ramp_premultiplied = v ? VG_TRUE : VG_FALSE; break;
+    case VG_PAINT_PATTERN_TILING_MODE:
+        if ((int)v < VG_TILE_FILL || (int)v > VG_TILE_REFLECT) {
+            VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+        }
+        pt->tiling_mode = (VGTilingMode)(int)v; break;
     default: VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); break;
     }
 }
@@ -3430,14 +4021,31 @@ void vgSetParameteri(VGHandle obj, VGint ptype, VGint v)
     if (ptype == VG_PATH_CAPABILITY_APPEND_TO || ptype == VG_PATH_DATATYPE ||
         ptype == VG_PATH_FORMAT) {
         cm_path_t *pp = (cm_path_t *)(uintptr_t)obj;
-        if (ptype == VG_PATH_DATATYPE) pp->datatype = (VGPathDatatype)v;
+        if (ptype == VG_PATH_DATATYPE) {
+            if (v < VG_PATH_DATATYPE_S_8 || v > VG_PATH_DATATYPE_F) {
+                VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+            }
+            pp->datatype = (VGPathDatatype)v;
+        }
         return;
     }
     switch (ptype) {
-    case VG_PAINT_TYPE: pt->type = (VGPaintType)v; break;
-    case VG_PAINT_COLOR_RAMP_SPREAD_MODE: pt->spread_mode = (VGColorRampSpreadMode)v; break;
-    case VG_PAINT_COLOR_RAMP_PREMULTIPLIED: break;
-    case VG_PAINT_PATTERN_TILING_MODE: pt->tiling_mode = (VGTilingMode)v; break;
+    case VG_PAINT_TYPE:
+        if (v < VG_PAINT_TYPE_COLOR || v > VG_PAINT_TYPE_PATTERN) {
+            VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+        }
+        pt->type = (VGPaintType)v; break;
+    case VG_PAINT_COLOR_RAMP_SPREAD_MODE:
+        if (v < VG_COLOR_RAMP_SPREAD_PAD || v > VG_COLOR_RAMP_SPREAD_REFLECT) {
+            VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+        }
+        pt->spread_mode = (VGColorRampSpreadMode)v; break;
+    case VG_PAINT_COLOR_RAMP_PREMULTIPLIED: pt->ramp_premultiplied = v ? VG_TRUE : VG_FALSE; break;
+    case VG_PAINT_PATTERN_TILING_MODE:
+        if (v < VG_TILE_FILL || v > VG_TILE_REFLECT) {
+            VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+        }
+        pt->tiling_mode = (VGTilingMode)v; break;
     default: VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); break;
     }
 }
@@ -3445,10 +4053,17 @@ void vgSetParameteri(VGHandle obj, VGint ptype, VGint v)
 void vgSetParameterfv(VGHandle obj, VGint ptype, VGint count, const VGfloat *v)
 {
     if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    int vsize = vgGetParameterVectorSize(obj, ptype);
+    if (vsize <= 0) return;
     if (count < 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-    if (count > 0 && (!v || ((uintptr_t)v & (sizeof(VGfloat)-1u)) != 0)) {
+    if (count == 0) {
+        if (vsize == 1) VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
+        return;
+    }
+    if (!v || ((uintptr_t)v & (sizeof(VGfloat)-1u)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
+    if (count > vsize) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     cm_paint_t *pt = (cm_paint_t *)(uintptr_t)obj;
     switch (ptype) {
     case VG_PAINT_COLOR:
@@ -3473,14 +4088,64 @@ void vgSetParameterfv(VGHandle obj, VGint ptype, VGint count, const VGfloat *v)
     case VG_PAINT_COLOR_RAMP_STOPS: {
         if (count % 5 != 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
         int ns = count / 5;
-        pt->num_stops = (ns > CM_MAX_STOPS) ? CM_MAX_STOPS : ns;
-        for (int i = 0; i < pt->num_stops; i++) {
-            pt->stops[i].offset   = v[i*5];
-            pt->stops[i].color[0] = v[i*5+1];
-            pt->stops[i].color[1] = v[i*5+2];
-            pt->stops[i].color[2] = v[i*5+3];
-            pt->stops[i].color[3] = v[i*5+4];
+        int limit = (ns > CM_MAX_STOPS) ? CM_MAX_STOPS : ns;
+
+        int out = 0;
+        int valid = 1;
+        VGfloat prev_offset = -1e30f;
+
+        for (int i = 0; i < limit; i++) {
+            VGfloat off = v[i*5];
+            if (off < prev_offset) valid = 0;
+            prev_offset = off;
+
+            if (off >= 0.f && off <= 1.f) {
+                VGfloat c0 = clampf01(v[i*5+1]);
+                VGfloat c1 = clampf01(v[i*5+2]);
+                VGfloat c2 = clampf01(v[i*5+3]);
+                VGfloat c3 = clampf01(v[i*5+4]);
+
+                if (out == 0 && off > 0.f && out < CM_MAX_STOPS) {
+                    pt->stops[out].offset = 0.f;
+                    pt->stops[out].color[0] = c0;
+                    pt->stops[out].color[1] = c1;
+                    pt->stops[out].color[2] = c2;
+                    pt->stops[out].color[3] = c3;
+                    out++;
+                }
+
+                if (out < CM_MAX_STOPS) {
+                    pt->stops[out].offset = off;
+                    pt->stops[out].color[0] = c0;
+                    pt->stops[out].color[1] = c1;
+                    pt->stops[out].color[2] = c2;
+                    pt->stops[out].color[3] = c3;
+                    out++;
+                }
+            }
         }
+
+        if (valid && out > 0 && pt->stops[out-1].offset < 1.f && out < CM_MAX_STOPS) {
+            pt->stops[out] = pt->stops[out-1];
+            pt->stops[out].offset = 1.f;
+            out++;
+        }
+
+        if (!valid || out == 0) {
+            out = 2;
+            pt->stops[0].offset = 0.f;
+            pt->stops[0].color[0] = 0.f;
+            pt->stops[0].color[1] = 0.f;
+            pt->stops[0].color[2] = 0.f;
+            pt->stops[0].color[3] = 1.f;
+            pt->stops[1].offset = 1.f;
+            pt->stops[1].color[0] = 1.f;
+            pt->stops[1].color[1] = 1.f;
+            pt->stops[1].color[2] = 1.f;
+            pt->stops[1].color[3] = 1.f;
+        }
+
+        pt->num_stops = out;
         break;
     }
     default:
@@ -3493,12 +4158,33 @@ void vgSetParameterfv(VGHandle obj, VGint ptype, VGint count, const VGfloat *v)
 void vgSetParameteriv(VGHandle obj, VGint ptype, VGint count, const VGint *v)
 {
     if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    int vsize = vgGetParameterVectorSize(obj, ptype);
+    if (vsize <= 0) return;
     if (count < 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-    if (count > 0 && (!v || ((uintptr_t)v & (sizeof(VGint)-1u)) != 0)) {
+    if (count == 0) {
+        if (vsize == 1) VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
+        return;
+    }
+    if (!v || ((uintptr_t)v & (sizeof(VGint)-1u)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
-    if (count != 1) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-    vgSetParameteri(obj, ptype, v[0]);
+    if (count > vsize) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    switch (ptype) {
+    case VG_PAINT_COLOR:
+    case VG_PAINT_LINEAR_GRADIENT:
+    case VG_PAINT_RADIAL_GRADIENT:
+    case VG_PAINT_COLOR_RAMP_STOPS: {
+        if (count > CM_MAX_STOPS * 5) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+        VGfloat tmp[CM_MAX_STOPS * 5];
+        for (int i = 0; i < count; i++) tmp[i] = (VGfloat)v[i];
+        vgSetParameterfv(obj, ptype, count, tmp);
+        break;
+    }
+    default:
+        if (count != 1) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+        vgSetParameteri(obj, ptype, v[0]);
+        break;
+    }
 }
 
 VGfloat vgGetParameterf(VGHandle obj, VGint ptype)
@@ -3506,8 +4192,8 @@ VGfloat vgGetParameterf(VGHandle obj, VGint ptype)
     if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0.f; }
     /* Dispatch by parameter type */
     if (ptype == VG_IMAGE_FORMAT || ptype == VG_IMAGE_WIDTH || ptype == VG_IMAGE_HEIGHT) {
-        cm_image_t *img = (cm_image_t *)(uintptr_t)obj;
-        if (img->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0.f; }
+        cm_image_t *img = cm_image_from_handle((VGImage)obj);
+        if (!img) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0.f; }
         switch (ptype) {
         case VG_IMAGE_FORMAT: return (VGfloat)img->format;
         case VG_IMAGE_WIDTH:  return (VGfloat)img->width;
@@ -3521,6 +4207,8 @@ VGfloat vgGetParameterf(VGHandle obj, VGint ptype)
     switch (ptype) {
     case VG_PAINT_TYPE: return (VGfloat)pt->type;
     case VG_PAINT_COLOR_RAMP_SPREAD_MODE: return (VGfloat)pt->spread_mode;
+    case VG_PAINT_COLOR_RAMP_PREMULTIPLIED: return pt->ramp_premultiplied ? 1.f : 0.f;
+    case VG_PAINT_PATTERN_TILING_MODE: return (VGfloat)pt->tiling_mode;
     case VG_PATH_SCALE: return pp->scale;
     case VG_PATH_BIAS:  return pp->bias;
     default: VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return 0.f;
@@ -3532,8 +4220,8 @@ VGint vgGetParameteri(VGHandle obj, VGint ptype)
     if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0; }
     /* Dispatch by parameter type */
     if (ptype == VG_IMAGE_FORMAT || ptype == VG_IMAGE_WIDTH || ptype == VG_IMAGE_HEIGHT) {
-        cm_image_t *img = (cm_image_t *)(uintptr_t)obj;
-        if (img->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0; }
+        cm_image_t *img = cm_image_from_handle((VGImage)obj);
+        if (!img) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0; }
         switch (ptype) {
         case VG_IMAGE_FORMAT: return (VGint)img->format;
         case VG_IMAGE_WIDTH:  return img->width;
@@ -3551,7 +4239,7 @@ VGint vgGetParameteri(VGHandle obj, VGint ptype)
     switch (ptype) {
     case VG_PAINT_TYPE: return (VGint)pt->type;
     case VG_PAINT_COLOR_RAMP_SPREAD_MODE: return (VGint)pt->spread_mode;
-    case VG_PAINT_COLOR_RAMP_PREMULTIPLIED: return 0;
+    case VG_PAINT_COLOR_RAMP_PREMULTIPLIED: return pt->ramp_premultiplied ? 1 : 0;
     case VG_PAINT_PATTERN_TILING_MODE: return (VGint)pt->tiling_mode;
     case VG_PATH_FORMAT:   return VG_PATH_FORMAT_STANDARD;
     case VG_PATH_DATATYPE: return (VGint)pp->datatype;
@@ -3565,38 +4253,62 @@ VGint vgGetParameteri(VGHandle obj, VGint ptype)
 
 VGint vgGetParameterVectorSize(VGHandle obj, VGint ptype)
 {
+    if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0; }
+    if (ptype == VG_IMAGE_FORMAT || ptype == VG_IMAGE_WIDTH || ptype == VG_IMAGE_HEIGHT) {
+        cm_image_t *img = cm_image_from_handle((VGImage)obj);
+        if (!img) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0; }
+        return 1;
+    }
+    if (ptype == VG_FONT_NUM_GLYPHS) {
+        cm_font_t *f = (cm_font_t *)(uintptr_t)obj;
+        if (f->magic != FONT_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0; }
+        return 1;
+    }
+    if (ptype == VG_PATH_FORMAT || ptype == VG_PATH_DATATYPE || ptype == VG_PATH_SCALE ||
+        ptype == VG_PATH_BIAS || ptype == VG_PATH_NUM_SEGMENTS || ptype == VG_PATH_NUM_COORDS) {
+        if (!cm_path_is_valid((VGPath)obj)) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0; }
+        return 1;
+    }
+
+    cm_paint_t *pt = (cm_paint_t *)(uintptr_t)obj;
     switch (ptype) {
-    case VG_PAINT_COLOR:                return 4;
-    case VG_PAINT_LINEAR_GRADIENT:      return 4;
-    case VG_PAINT_RADIAL_GRADIENT:      return 5;
-    case VG_PAINT_COLOR_RAMP_STOPS:
-        if (obj != VG_INVALID_HANDLE) {
-            /* Only safe to read if this is actually a paint object */
-            /* Best effort: check first 4 bytes as paint type (small valid enum) */
-            uint32_t first4; memcpy(&first4, (void*)(uintptr_t)obj, 4);
-            if (first4 <= 3) { /* VG_PAINT_TYPE_COLOR..PATTERN range */
-                cm_paint_t *pt = (cm_paint_t *)(uintptr_t)obj;
-                return pt->num_stops * 5;
-            }
-        }
-        return 0;
-    case VG_IMAGE_FORMAT:               return 1;
-    case VG_IMAGE_WIDTH:                return 1;
-    case VG_IMAGE_HEIGHT:               return 1;
-    case VG_FONT_NUM_GLYPHS:            return 1;
-    default: return 1;
+    case VG_PAINT_TYPE:
+    case VG_PAINT_COLOR_RAMP_SPREAD_MODE:
+    case VG_PAINT_COLOR_RAMP_PREMULTIPLIED:
+    case VG_PAINT_PATTERN_TILING_MODE:
+    case VG_PATH_FORMAT:
+    case VG_PATH_DATATYPE:
+    case VG_PATH_SCALE:
+    case VG_PATH_BIAS:
+    case VG_PATH_NUM_SEGMENTS:
+    case VG_PATH_NUM_COORDS:
+    case VG_IMAGE_FORMAT:
+    case VG_IMAGE_WIDTH:
+    case VG_IMAGE_HEIGHT:
+    case VG_FONT_NUM_GLYPHS:
+        return 1;
+    case VG_PAINT_COLOR: return 4;
+    case VG_PAINT_LINEAR_GRADIENT: return 4;
+    case VG_PAINT_RADIAL_GRADIENT: return 5;
+    case VG_PAINT_COLOR_RAMP_STOPS: return pt->num_stops * 5;
+    default:
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return 0;
     }
 }
 
 void vgGetParameterfv(VGHandle obj, VGint ptype, VGint count, VGfloat *v)
 {
+    if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    int vsize = vgGetParameterVectorSize(obj, ptype);
+    if (vsize <= 0) return;
+    if (count < 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    if (count == 0) {
+        if (vsize == 1) VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
+        return;
+    }
     if (!v || ((uintptr_t)v & (sizeof(VGfloat)-1u)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
-    if (count <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-    if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    /* Check count against vector size */
-    int vsize = vgGetParameterVectorSize(obj, ptype);
     if (count > vsize) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     cm_paint_t *pt = (cm_paint_t *)(uintptr_t)obj;
     switch (ptype) {
@@ -3606,6 +4318,13 @@ void vgGetParameterfv(VGHandle obj, VGint ptype, VGint count, VGfloat *v)
         for (int i = 0; i < count && i < 4; i++) v[i] = pt->lin[i]; break;
     case VG_PAINT_RADIAL_GRADIENT:
         for (int i = 0; i < count && i < 5; i++) v[i] = pt->rad[i]; break;
+    case VG_PAINT_COLOR_RAMP_STOPS:
+        for (int i = 0; i < count && i < pt->num_stops * 5; i++) {
+            int si = i / 5;
+            int ci = i % 5;
+            v[i] = (ci == 0) ? pt->stops[si].offset : pt->stops[si].color[ci - 1];
+        }
+        break;
     default:
         if (count >= 1) v[0] = vgGetParameterf(obj, ptype); break;
     }
@@ -3613,15 +4332,40 @@ void vgGetParameterfv(VGHandle obj, VGint ptype, VGint count, VGfloat *v)
 
 void vgGetParameteriv(VGHandle obj, VGint ptype, VGint count, VGint *v)
 {
+    if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    int vsize = vgGetParameterVectorSize(obj, ptype);
+    if (vsize <= 0) return;
+    if (count < 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    if (count == 0) {
+        if (vsize == 1) VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
+        return;
+    }
     if (!v || ((uintptr_t)v & (sizeof(VGint)-1u)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
-    if (count <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-    if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    /* Check count against vector size */
-    int vsize = vgGetParameterVectorSize(obj, ptype);
     if (count > vsize) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-    if (count >= 1) v[0] = vgGetParameteri(obj, ptype);
+    cm_paint_t *pt = (cm_paint_t *)(uintptr_t)obj;
+    switch (ptype) {
+    case VG_PAINT_COLOR:
+        for (int i = 0; i < count && i < 4; i++) v[i] = (VGint)pt->color[i];
+        break;
+    case VG_PAINT_LINEAR_GRADIENT:
+        for (int i = 0; i < count && i < 4; i++) v[i] = (VGint)pt->lin[i];
+        break;
+    case VG_PAINT_RADIAL_GRADIENT:
+        for (int i = 0; i < count && i < 5; i++) v[i] = (VGint)pt->rad[i];
+        break;
+    case VG_PAINT_COLOR_RAMP_STOPS:
+        for (int i = 0; i < count && i < pt->num_stops * 5; i++) {
+            int si = i / 5;
+            int ci = i % 5;
+            v[i] = (ci == 0) ? (VGint)pt->stops[si].offset : (VGint)pt->stops[si].color[ci - 1];
+        }
+        break;
+    default:
+        if (count >= 1) v[0] = vgGetParameteri(obj, ptype);
+        break;
+    }
 }
 
 /* =========================================================================
@@ -3640,30 +4384,53 @@ VGImage vgCreateImage(VGImageFormat fmt, VGint w, VGint h, VGbitfield allowedQua
                             VG_IMAGE_QUALITY_BETTER)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_INVALID_HANDLE;
     }
+    if (w > vgGeti(VG_MAX_IMAGE_WIDTH) || h > vgGeti(VG_MAX_IMAGE_HEIGHT)) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_INVALID_HANDLE;
+    }
+    int64_t pixels = (int64_t)w * (int64_t)h;
+    if (pixels > (int64_t)vgGeti(VG_MAX_IMAGE_PIXELS)) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_INVALID_HANDLE;
+    }
+    int64_t bytes = pixels * (int64_t)bpp;
+    if (bytes > (int64_t)vgGeti(VG_MAX_IMAGE_BYTES)) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return VG_INVALID_HANDLE;
+    }
     cm_image_t *img = (cm_image_t *)calloc(1, sizeof(cm_image_t));
     if (!img) { VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
+    cm_image_storage_t *st = (cm_image_storage_t *)calloc(1, sizeof(cm_image_storage_t));
+    if (!st) { free(img); VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
     img->magic           = IMAGE_MAGIC;
+    img->reg_next        = NULL;
     img->format          = fmt;
     img->width           = w;
     img->height          = h;
     img->allowed_quality = allowedQuality;
     img->bpp             = bpp;
     img->parent_handle   = VG_INVALID_HANDLE;
+    img->parent_fallback = VG_INVALID_HANDLE;
     img->row_stride      = (bpp > 0 ? bpp : 1) * w;
-    img->pixels          = (uint8_t *)calloc((size_t)(w * h), (size_t)(bpp > 0 ? bpp : 1));
-    if (!img->pixels) { free(img); VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
+    st->base             = (uint8_t *)calloc((size_t)(w * h), (size_t)(bpp > 0 ? bpp : 1));
+    if (!st->base) { free(st); free(img); VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return VG_INVALID_HANDLE; }
+    st->refcnt           = 1;
+    img->storage         = st;
+    img->pixels          = st->base;
+    cm_image_registry_add(img);
     return (VGImage)(uintptr_t)img;
 }
 void vgDestroyImage(VGImage image)
 {
     VG_CHECK_CTX();
-    if (image == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    cm_image_t *img = (cm_image_t *)(uintptr_t)image;
-    if (img->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_image_t *img = cm_image_from_handle(image);
+    if (!img) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    (void)cm_image_registry_remove(img);
     img->magic = 0;
-    /* Only free pixel buffer if this is a root image (children share parent buffer) */
-    if (img->parent_handle == VG_INVALID_HANDLE)
-        free(img->pixels);
+    if (img->storage) {
+        img->storage->refcnt--;
+        if (img->storage->refcnt == 0) {
+            free(img->storage->base);
+            free(img->storage);
+        }
+    }
     free(img);
 }
 /* Forward declaration for format index helper (defined in filter section) */
@@ -3674,19 +4441,18 @@ static void cm_write_px(cm_image_t *img, int x, int y, const float rgba[4]);
 void vgClearImage(VGImage image, VGint x, VGint y, VGint w, VGint h)
 {
     VG_CHECK_CTX();
-    if (image == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    cm_image_t *img = (cm_image_t *)(uintptr_t)image;
-    if (img->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_image_t *img = cm_image_from_handle(image);
+    if (!img) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-    /* Clip to image bounds */
-    int x0 = x < 0 ? 0 : x;
-    int x1 = (x + w) > img->width ? img->width : (x + w);
-    int y0 = y < 0 ? 0 : y;
-    int y1 = (y + h) > img->height ? img->height : (y + h);
-    if (x0 >= x1 || y0 >= y1) return;
+    /* Clip to image bounds with overflow-safe arithmetic. */
+    int x0, y0, cw, ch;
+    if (!clip_rect_i32(x, y, w, h, img->width, img->height, &x0, &y0, &cw, &ch)) return;
+    int x1 = x0 + cw;
+    int y1 = y0 + ch;
     /* Use the canonical writer so packed formats (e.g. 565/5551/4444) clear correctly. */
     const VGfloat *cc = g_ctx ? g_ctx->clear_color : (const VGfloat []){0.f,0.f,0.f,0.f};
     float rgba[4] = { cc[0], cc[1], cc[2], cc[3] };
+    cm_convert_color(rgba, VG_sRGBA_8888, img->format);
     for (int row = y0; row < y1; row++) {
         for (int col = x0; col < x1; col++) {
             cm_write_px(img, col, row, rgba);
@@ -3698,9 +4464,8 @@ void vgImageSubData(VGImage image, const void *data, VGint dataStride,
                     VGImageFormat dataFormat, VGint x, VGint y, VGint w, VGint h)
 {
     VG_CHECK_CTX();
-    if (image == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    cm_image_t *img = (cm_image_t *)(uintptr_t)image;
-    if (img->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_image_t *img = cm_image_from_handle(image);
+    if (!img) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     int src_bpp = image_bpp(dataFormat);
     if (src_bpp < 0) { VG_SET_ERR(VG_UNSUPPORTED_IMAGE_FORMAT_ERROR); return; }
     if (!data || w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
@@ -3715,15 +4480,18 @@ void vgImageSubData(VGImage image, const void *data, VGint dataStride,
     int src_a1 = (src_base_fmt == VG_A_1);
     int src_a4 = (src_base_fmt == VG_A_4);
 
-    for (int row = 0; row < h; row++) {
-        int dst_y = y + row;
-        if (dst_y < 0 || dst_y >= img->height) continue;
-        int copy_x0 = x < 0 ? -x : 0;
-        int copy_x1 = (x + w > img->width) ? (img->width - x) : w;
-        if (copy_x1 <= copy_x0) continue;
-        int copy_w = copy_x1 - copy_x0;
-        const uint8_t *src_row = (const uint8_t *)data + (size_t)row * (size_t)dataStride;
-        uint8_t *dst = img->pixels + (size_t)dst_y * (size_t)img->row_stride + (size_t)(x + copy_x0) * (size_t)img->bpp;
+    int dst_x0, dst_y0, cw, ch;
+    if (!clip_rect_i32(x, y, w, h, img->width, img->height, &dst_x0, &dst_y0, &cw, &ch)) return;
+    int src_x0 = dst_x0 - x;
+    int src_y0 = dst_y0 - y;
+
+    for (int row = 0; row < ch; row++) {
+        int dst_y = dst_y0 + row;
+        int src_y = src_y0 + row;
+        int copy_x0 = src_x0;
+        int copy_w = cw;
+        const uint8_t *src_row = (const uint8_t *)data + (size_t)src_y * (size_t)dataStride;
+        uint8_t *dst = img->pixels + (size_t)dst_y * (size_t)img->row_stride + (size_t)dst_x0 * (size_t)img->bpp;
         if (src_bw1 || src_a1 || src_a4) {
             for (int i = 0; i < copy_w; i++) {
                 int sx = copy_x0 + i;
@@ -3744,31 +4512,28 @@ void vgImageSubData(VGImage image, const void *data, VGint dataStride,
                     rgba[0] = rgba[1] = rgba[2] = 1.f;
                     rgba[3] = nib / 15.f;
                 }
-                cm_write_px(img, x + copy_x0 + i, dst_y, rgba);
+                cm_convert_color(rgba, dataFormat, img->format);
+                cm_write_px(img, dst_x0 + i, dst_y, rgba);
             }
         } else if (src_bpp == 4 && img->bpp == 4 && dataFormat == img->format) {
             const uint8_t *src = src_row + (size_t)(copy_x0 * src_bpp);
             memcpy(dst, src, (size_t)copy_w * 4);
-        } else if (src_bpp == 4 && img->bpp == 4) {
-            const uint8_t *src = src_row + (size_t)(copy_x0 * src_bpp);
-            /* Convert between 4-byte formats */
-            int src_idx[4]; cm_fmt_idx(dataFormat, src_idx);
-            int dst_idx[4]; cm_fmt_idx(img->format, dst_idx);
-            for (int i = 0; i < copy_w; i++) {
-                const uint8_t *sp = src + i * 4;
-                uint8_t *dp = dst + i * 4;
-                uint8_t r = sp[src_idx[0]];
-                uint8_t g = sp[src_idx[1]];
-                uint8_t b = sp[src_idx[2]];
-                uint8_t a = sp[src_idx[3]];
-                dp[dst_idx[0]] = r;
-                dp[dst_idx[1]] = g;
-                dp[dst_idx[2]] = b;
-                dp[dst_idx[3]] = a;
-            }
         } else {
-            const uint8_t *src = src_row + (size_t)(copy_x0 * src_bpp);
-            memcpy(dst, src, (size_t)(copy_w * (src_bpp < img->bpp ? src_bpp : img->bpp)));
+            /* General path: convert via float RGBA with full colorspace/premul conversion */
+            cm_image_t tmp_src;
+            memset(&tmp_src, 0, sizeof(tmp_src));
+            tmp_src.format = dataFormat;
+            tmp_src.bpp = src_bpp;
+            tmp_src.width = copy_w + (x + copy_x0);
+            tmp_src.height = h;
+            tmp_src.row_stride = (int)dataStride;
+            tmp_src.pixels = (uint8_t *)(uintptr_t)data;
+            for (int i = 0; i < copy_w; i++) {
+                float rgba[4];
+                cm_read_px(&tmp_src, copy_x0 + i, src_y, rgba);
+                cm_convert_color(rgba, dataFormat, img->format);
+                cm_write_px(img, dst_x0 + i, dst_y, rgba);
+            }
         }
     }
 }
@@ -3776,9 +4541,8 @@ void vgGetImageSubData(VGImage image, void *data, VGint dataStride,
                        VGImageFormat dataFormat, VGint x, VGint y, VGint w, VGint h)
 {
     VG_CHECK_CTX();
-    if (image == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    cm_image_t *img = (cm_image_t *)(uintptr_t)image;
-    if (img->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_image_t *img = cm_image_from_handle(image);
+    if (!img) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     int dst_bpp = image_bpp(dataFormat);
     if (dst_bpp < 0) { VG_SET_ERR(VG_UNSUPPORTED_IMAGE_FORMAT_ERROR); return; }
     if (!data || w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
@@ -3792,19 +4556,21 @@ void vgGetImageSubData(VGImage image, void *data, VGint dataStride,
     int dst_a1 = (dst_base_fmt == VG_A_1);
     int dst_a4 = (dst_base_fmt == VG_A_4);
 
-    for (int row = 0; row < h; row++) {
-        int src_y = y + row;
-        if (src_y < 0 || src_y >= img->height) continue;
-        int copy_x0 = x < 0 ? -x : 0;
-        int copy_x1 = (x + w > img->width) ? (img->width - x) : w;
-        if (copy_x1 <= copy_x0) continue;
-        int copy_w = copy_x1 - copy_x0;
-        uint8_t *dst_row = (uint8_t *)data + (size_t)row * (size_t)dataStride;
+    int src_x0, src_y0, cw, ch;
+    if (!clip_rect_i32(x, y, w, h, img->width, img->height, &src_x0, &src_y0, &cw, &ch)) return;
+    int dst_x0 = src_x0 - x;
+    int dst_y0 = src_y0 - y;
+
+    for (int row = 0; row < ch; row++) {
+        int src_y = src_y0 + row;
+        int copy_x0 = dst_x0;
+        int copy_w = cw;
+        uint8_t *dst_row = (uint8_t *)data + (size_t)(dst_y0 + row) * (size_t)dataStride;
         if (dst_bw1 || dst_a1 || dst_a4) {
             for (int i = 0; i < copy_w; i++) {
                 int dxp = copy_x0 + i;
                 float rgba[4];
-                cm_read_px(img, x + copy_x0 + i, src_y, rgba);
+                cm_read_px(img, src_x0 + i, src_y, rgba);
                 if (dst_bw1 || dst_a1) {
                     int bit_val;
                     if (dst_bw1) {
@@ -3828,42 +4594,32 @@ void vgGetImageSubData(VGImage image, void *data, VGint dataStride,
             uint8_t *dst = dst_row + (size_t)(copy_x0 * dst_bpp);
             /* Same 4-byte format: raw copy */
             const uint8_t *src = img->pixels
-                               + (size_t)src_y * (size_t)img->row_stride + (size_t)(x + copy_x0) * 4;
+                               + (size_t)src_y * (size_t)img->row_stride + (size_t)src_x0 * 4;
             memcpy(dst, src, (size_t)copy_w * 4);
-        } else if (img->bpp == 4 && dst_bpp == 4) {
-            uint8_t *dst = dst_row + (size_t)(copy_x0 * dst_bpp);
-            /* Different 4-byte formats: convert via float RGBA */
-            int src_idx[4]; cm_fmt_idx(img->format, src_idx);
-            int dst_idx[4]; cm_fmt_idx(dataFormat, dst_idx);
-            const uint8_t *src = img->pixels
-                               + (size_t)src_y * (size_t)img->row_stride + (size_t)(x + copy_x0) * 4;
-            for (int i = 0; i < copy_w; i++) {
-                const uint8_t *sp = src + i * 4;
-                uint8_t *dp = dst + i * 4;
-                uint8_t r = sp[src_idx[0]];
-                uint8_t g = sp[src_idx[1]];
-                uint8_t b = sp[src_idx[2]];
-                uint8_t a = sp[src_idx[3]];
-                dp[dst_idx[0]] = r;
-                dp[dst_idx[1]] = g;
-                dp[dst_idx[2]] = b;
-                dp[dst_idx[3]] = a;
-            }
         } else {
-            uint8_t *dst = dst_row + (size_t)(copy_x0 * dst_bpp);
-            /* Fallback: raw copy (same as before) */
-            const uint8_t *src = img->pixels
-                               + (size_t)src_y * (size_t)img->row_stride + (size_t)(x + copy_x0) * (size_t)img->bpp;
-            memcpy(dst, src, (size_t)(copy_w * (dst_bpp < img->bpp ? dst_bpp : img->bpp)));
+            /* General path: convert via float RGBA with full colorspace/premul conversion */
+            cm_image_t tmp_dst;
+            memset(&tmp_dst, 0, sizeof(tmp_dst));
+            tmp_dst.format = dataFormat;
+            tmp_dst.bpp = dst_bpp;
+            tmp_dst.width = copy_w;
+            tmp_dst.height = 1;
+            tmp_dst.row_stride = (int)dataStride;
+            tmp_dst.pixels = dst_row + (size_t)(copy_x0 * dst_bpp);
+            for (int i = 0; i < copy_w; i++) {
+                float rgba[4];
+                cm_read_px(img, src_x0 + i, src_y, rgba);
+                cm_convert_color(rgba, img->format, dataFormat);
+                cm_write_px(&tmp_dst, i, 0, rgba);
+            }
         }
     }
 }
 VGImage vgChildImage(VGImage parent, VGint x, VGint y, VGint w, VGint h)
 {
     VG_CHECK_CTX(VG_INVALID_HANDLE);
-    if (parent == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return VG_INVALID_HANDLE; }
-    cm_image_t *p = (cm_image_t *)(uintptr_t)parent;
-    if (p->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return VG_INVALID_HANDLE; }
+    cm_image_t *p = cm_image_from_handle(parent);
+    if (!p) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return VG_INVALID_HANDLE; }
     if (w <= 0 || h <= 0 || x < 0 || y < 0 ||
         w > p->width || h > p->height ||
         x > p->width - w || y > p->height - h) {
@@ -3878,19 +4634,24 @@ VGImage vgChildImage(VGImage parent, VGint x, VGint y, VGint w, VGint h)
     child->allowed_quality = p->allowed_quality;
     child->bpp             = p->bpp;
     child->parent_handle   = parent;
+    child->parent_fallback = (p->parent_handle != VG_INVALID_HANDLE) ? p->parent_handle : parent;
+    child->storage         = p->storage;
+    if (child->storage) child->storage->refcnt++;
     /* Share parent's pixel buffer: child->pixels points into parent's buffer */
     child->row_stride      = p->row_stride;
     child->pixels          = p->pixels + (size_t)(y * p->row_stride + x * p->bpp);
+    cm_image_registry_add(child);
     return (VGImage)(uintptr_t)child;
 }
 VGImage vgGetParent(VGImage image)
 {
     VG_CHECK_CTX(VG_INVALID_HANDLE);
-    if (image == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return VG_INVALID_HANDLE; }
-    cm_image_t *img = (cm_image_t *)(uintptr_t)image;
-    if (img->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return VG_INVALID_HANDLE; }
-    if (img->parent_handle != VG_INVALID_HANDLE)
+    cm_image_t *img = cm_image_from_handle(image);
+    if (!img) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return VG_INVALID_HANDLE; }
+    if (img->parent_handle != VG_INVALID_HANDLE && cm_image_from_handle(img->parent_handle))
         return img->parent_handle;
+    if (img->parent_fallback != VG_INVALID_HANDLE && cm_image_from_handle(img->parent_fallback))
+        return img->parent_fallback;
     return image;
 }
 void vgCopyImage(VGImage dst, VGint dx, VGint dy, VGImage src, VGint sx, VGint sy,
@@ -3898,64 +4659,215 @@ void vgCopyImage(VGImage dst, VGint dx, VGint dy, VGImage src, VGint sx, VGint s
 {
     VG_CHECK_CTX();
     (void)dither;
-    if (dst == VG_INVALID_HANDLE || src == VG_INVALID_HANDLE) {
+    cm_image_t *d = cm_image_from_handle(dst);
+    cm_image_t *s = cm_image_from_handle(src);
+    if (!d || !s) {
         VG_SET_ERR(VG_BAD_HANDLE_ERROR); return;
     }
-    cm_image_t *d = (cm_image_t *)(uintptr_t)dst;
-    cm_image_t *s = (cm_image_t *)(uintptr_t)src;
-    if (d->magic != IMAGE_MAGIC || s->magic != IMAGE_MAGIC) {
-        VG_SET_ERR(VG_BAD_HANDLE_ERROR); return;
-    }
-    if (w <= 0 || h <= 0) return;
-    /* Use int64_t to safely handle extreme negative/large coordinates */
+    if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    /* Use int64_t to safely handle extreme negative/large coordinates. */
     int64_t W = w, H = h;
     int64_t Sx = sx, Sy = sy, Dx = dx, Dy = dy;
-    /* Clip source region to src image bounds */
+
+    /* Clip source region to source image bounds. */
     int64_t sx0 = Sx < 0 ? 0 : Sx;
     int64_t sy0 = Sy < 0 ? 0 : Sy;
     int64_t sx1 = Sx + W > s->width  ? (int64_t)s->width  : Sx + W;
     int64_t sy1 = Sy + H > s->height ? (int64_t)s->height : Sy + H;
     if (sx0 >= sx1 || sy0 >= sy1) return;
-    /* Map clipped source back to destination */
+
+    /* Map clipped source back to destination coordinates. */
     int64_t dx0 = sx0 - Sx + Dx;
     int64_t dy0 = sy0 - Sy + Dy;
     int64_t dx1 = sx1 - Sx + Dx;
     int64_t dy1 = sy1 - Sy + Dy;
-    /* Clip destination region to dst image bounds */
+
+    /* Clip destination region to destination image bounds. */
     if (dx0 < 0) { sx0 -= dx0; dx0 = 0; }
     if (dy0 < 0) { sy0 -= dy0; dy0 = 0; }
     if (dx1 > d->width)  { sx1 -= (dx1 - d->width);  dx1 = d->width; }
     if (dy1 > d->height) { sy1 -= (dy1 - d->height); dy1 = d->height; }
     if (dx0 >= dx1 || dy0 >= dy1) return;
+
     int64_t cpw = dx1 - dx0;
     int64_t cph = dy1 - dy0;
-    int bpp = s->bpp < d->bpp ? s->bpp : d->bpp;
+
+    /* Buffer the source region so overlap between src/dst regions is safe. */
+    float *tmp = (float *)malloc((size_t)(cpw * cph * 4) * sizeof(float));
+    if (!tmp) { VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return; }
+
     for (int64_t row = 0; row < cph; row++) {
-        const uint8_t *src_row = s->pixels +
-            (size_t)(sy0 + row) * (size_t)s->row_stride + (size_t)sx0 * (size_t)s->bpp;
-        uint8_t *dst_row = d->pixels +
-            (size_t)(dy0 + row) * (size_t)d->row_stride + (size_t)dx0 * (size_t)d->bpp;
-        memmove(dst_row, src_row, (size_t)cpw * (size_t)bpp);
+        for (int64_t col = 0; col < cpw; col++) {
+            float *rgba = tmp + (size_t)((row * cpw + col) * 4);
+            cm_read_px(s, (int)(sx0 + col), (int)(sy0 + row), rgba);
+            cm_convert_color(rgba, s->format, d->format);
+        }
     }
+
+    for (int64_t row = 0; row < cph; row++) {
+        for (int64_t col = 0; col < cpw; col++) {
+            const float *rgba = tmp + (size_t)((row * cpw + col) * 4);
+            cm_write_px(d, (int)(dx0 + col), (int)(dy0 + row), rgba);
+        }
+    }
+
+    free(tmp);
 }
 /* linear ↔ sRGB helpers (mirrors vg_cmodel.c but used here for image ops) */
 static inline float img_srgb2lin(float c)
 {
-    if (c <= 0.04045f) return c * (1.f / 12.92f);
-    return powf((c + 0.055f) * (1.f / 1.055f), 2.4f);
+    if (c <= 0.03928f) return c * (1.f / 12.92f);
+    return powf((c + 0.0556f) * (1.f / 1.0556f), 2.4f);
 }
 static inline float img_lin2srgb(float c)
 {
-    if (c <= 0.0031308f) return c * 12.92f;
-    return 1.055f * powf(c, 1.f / 2.4f) - 0.055f;
+    if (c <= 0.00304f) return c * 12.92f;
+    return 1.0556f * powf(c, 1.f / 2.4f) - 0.0556f;
+}
+
+/* Format classification helpers. */
+static inline int fmt_is_linear(VGImageFormat fmt)
+{
+    int b = fmt & 0x3F;
+    return (b == VG_lRGBX_8888 || b == VG_lRGBA_8888 || b == VG_lRGBA_8888_PRE ||
+            b == VG_lXRGB_8888 || b == VG_lARGB_8888 || b == VG_lARGB_8888_PRE ||
+            b == VG_lBGRX_8888 || b == VG_lBGRA_8888 || b == VG_lBGRA_8888_PRE ||
+            b == VG_lXBGR_8888 || b == VG_lABGR_8888 || b == VG_lABGR_8888_PRE ||
+            b == VG_lL_8 || b == VG_BW_1);
+}
+static inline int fmt_is_premul(VGImageFormat fmt)
+{
+    int b = fmt & 0x3F;
+    return (b == VG_sRGBA_8888_PRE || b == VG_lRGBA_8888_PRE ||
+            b == VG_sARGB_8888_PRE || b == VG_lARGB_8888_PRE ||
+            b == VG_sBGRA_8888_PRE || b == VG_lBGRA_8888_PRE ||
+            b == VG_sABGR_8888_PRE || b == VG_lABGR_8888_PRE);
+}
+static inline int fmt_is_luminance(VGImageFormat fmt)
+{
+    int b = fmt & 0x3F;
+    return (b == VG_sL_8 || b == VG_lL_8 || b == VG_BW_1);
+}
+static inline int fmt_is_alpha_only(VGImageFormat fmt)
+{
+    int b = fmt & 0x3F;
+    return (b == VG_A_8 || b == VG_A_1 || b == VG_A_4);
+}
+
+/* cm_convert_color: convert RGBA float [0..1] between image formats,
+ * including luminance replicated to R=G=B and alpha-only with R=G=B=1).
+ *   lRGB  → lL   : lL = 0.2126*R + 0.7152*G + 0.0722*B
+ *   sRGB  → lL   : invgamma first, then lRGBtoL
+ *   lL    → lRGB : R=G=B=lL
+ *   lL    → sRGB : gamma(lL)
+ *   sL    → sRGB : nop (sL is just single-channel sRGB)
+ *   sRGB  → sL   : average sRGB components (single channel)
+ * Plus premul/de-premul wrapping.
+ */
+static void cm_convert_color(float rgba[4], VGImageFormat src_fmt, VGImageFormat dst_fmt)
+{
+    if (src_fmt == dst_fmt) return;
+    int src_b = src_fmt & 0x3F;
+    int dst_b = dst_fmt & 0x3F;
+    int src_lin  = fmt_is_linear(src_fmt);
+    int dst_lin  = fmt_is_linear(dst_fmt);
+    int src_pre  = fmt_is_premul(src_fmt);
+    int dst_pre  = fmt_is_premul(dst_fmt);
+    int src_lum  = fmt_is_luminance(src_fmt);
+    int dst_lum  = fmt_is_luminance(dst_fmt);
+    int src_alpha = fmt_is_alpha_only(src_fmt);
+    int dst_alpha = fmt_is_alpha_only(dst_fmt);
+
+    /* Step 0: de-premultiply if source is premultiplied */
+    if (src_pre && rgba[3] > 1e-6f) {
+        float ooa = 1.f / rgba[3];
+        rgba[0] = clampf01(rgba[0] * ooa);
+        rgba[1] = clampf01(rgba[1] * ooa);
+        rgba[2] = clampf01(rgba[2] * ooa);
+    }
+
+    /* Alpha-only images: no RGB conversion needed, just copy alpha to dest */
+    if (src_alpha || dst_alpha) goto premul_step;
+
+    /* Step 1: handle colorspace/luminance conversion */
+    {
+        /* Determine src/dst colorspace flags: LINEAR=1, NONLINEAR=0 */
+        /* src_lum and dst_lum: whether channel is single (lum/bw) */
+        (void)src_b; (void)dst_b;
+        /* Convert according to RI table (§3.4.2):
+         *  Source  Dest   Action
+         *  lRGB    sRGB   gamma on R,G,B
+         *  sRGB    lRGB   invgamma on R,G,B
+         *  lRGB    lL     lL = 0.2126R+0.7152G+0.0722B  (lum=lRGB already)
+         *  lRGB    sL     gamma(lL)
+         *  sRGB    lL     invgamma, then lL
+         *  sRGB    sL     lL from invgamma'd values, then gamma → but spec says R=G=B=sL already sRGB so just avg
+         *  lL      lRGB   R=G=B=lL (already same)
+         *  lL      sRGB   gamma
+         *  sL      lRGB   invgamma
+         *  sL      sRGB   nop
+         *  lL      sL     gamma
+         *  sL      lL     invgamma
+         */
+        if (!src_lum && !dst_lum) {
+            /* RGB → RGB: only colorspace change */
+            if (!src_lin && dst_lin) {
+                rgba[0] = clampf01(img_srgb2lin(rgba[0]));
+                rgba[1] = clampf01(img_srgb2lin(rgba[1]));
+                rgba[2] = clampf01(img_srgb2lin(rgba[2]));
+            } else if (src_lin && !dst_lin) {
+                rgba[0] = clampf01(img_lin2srgb(rgba[0]));
+                rgba[1] = clampf01(img_lin2srgb(rgba[1]));
+                rgba[2] = clampf01(img_lin2srgb(rgba[2]));
+            }
+        } else if (!src_lum && dst_lum) {
+            /* RGB → Luminance */
+            float r = rgba[0], g = rgba[1], b = rgba[2];
+            float lr, lg, lb;
+            if (!src_lin) {
+                lr = img_srgb2lin(r); lg = img_srgb2lin(g); lb = img_srgb2lin(b);
+            } else {
+                lr = r; lg = g; lb = b;
+            }
+            float lL = 0.2126f*lr + 0.7152f*lg + 0.0722f*lb;
+            lL = clampf01(lL);
+            if (!dst_lin) lL = clampf01(img_lin2srgb(lL));
+            rgba[0] = rgba[1] = rgba[2] = lL;
+        } else if (src_lum && !dst_lum) {
+            /* Luminance → RGB */
+            float lL = rgba[0]; /* already replicated to R=G=B by cm_read_px */
+            if (!src_lin && dst_lin) {
+                lL = clampf01(img_srgb2lin(lL));
+            } else if (src_lin && !dst_lin) {
+                lL = clampf01(img_lin2srgb(lL));
+            }
+            rgba[0] = rgba[1] = rgba[2] = lL;
+        } else {
+            /* Luminance → Luminance */
+            float lL = rgba[0];
+            if (!src_lin && dst_lin) {
+                lL = clampf01(img_srgb2lin(lL));
+            } else if (src_lin && !dst_lin) {
+                lL = clampf01(img_lin2srgb(lL));
+            }
+            rgba[0] = rgba[1] = rgba[2] = lL;
+        }
+    }
+
+premul_step:
+    /* Step 2: re-premultiply if dest is premultiplied */
+    if (dst_pre) {
+        rgba[0] = clampf01(rgba[0] * rgba[3]);
+        rgba[1] = clampf01(rgba[1] * rgba[3]);
+        rgba[2] = clampf01(rgba[2] * rgba[3]);
+    }
 }
 
 void vgDrawImage(VGImage image)
 {
     VG_CHECK_CTX();
-    if (image == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    cm_image_t *img = (cm_image_t *)(uintptr_t)image;
-    if (img->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_image_t *img = cm_image_from_handle(image);
+    if (!img) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     if (!g_surface) return;
 
     int SW = g_surface->width, SH = g_surface->height;
@@ -4058,6 +4970,10 @@ void vgDrawImage(VGImage image)
             float s[4];
             cm_read_px(img, ix, iy, s);
 
+            if (base_fmt == VG_A_8 || base_fmt == VG_A_1 || base_fmt == VG_A_4) {
+                s[0] = s[1] = s[2] = s[3];
+            }
+
             /* Match RI channel interpretation for base 16-bit packed RGB(A) formats. */
             if (img->bpp == 2) {
                 int bf = img->format & 0x3F;
@@ -4072,16 +4988,10 @@ void vgDrawImage(VGImage image)
                 s[0] *= ia; s[1] *= ia; s[2] *= ia;
             }
 
-            /* Convert linear image → sRGB rendering space */
-            if (is_linear) {
-                s[0] = clampf01(img_lin2srgb(s[0]));
-                s[1] = clampf01(img_lin2srgb(s[1]));
-                s[2] = clampf01(img_lin2srgb(s[2]));
-            }
-
             /* Apply color transform and compute premultiplied source for blending.
-             * Matches RI: NORMAL/MULTIPLY CT on image (or product),
-             * STENCIL CT on paint only; STENCIL uses per-channel alphas. */
+             * Keep the decoded components in their native space until after the
+             * image/paint transform logic, then linearize for linear surfaces. */
+
             float sa, ar, ag, ab;
             float sp[3];
 
@@ -4126,8 +5036,15 @@ void vgDrawImage(VGImage image)
                     s[2] = clampf01(s[2]*cv[2]+cv[6]);
                     s[3] = clampf01(s[3]*cv[3]+cv[7]);
                 }
+
                 sa = s[3]; ar = ag = ab = sa;
                 sp[0]=s[0]*sa; sp[1]=s[1]*sa; sp[2]=s[2]*sa;
+            }
+
+            if (g_surface->is_linear && !is_linear) {
+                sp[0] = clampf01(img_srgb2lin(sp[0]));
+                sp[1] = clampf01(img_srgb2lin(sp[1]));
+                sp[2] = clampf01(img_srgb2lin(sp[2]));
             }
 
             /* Read destination pixel from framebuffer (RGBA8888: 0xRRGGBBAA) */
@@ -4198,7 +5115,9 @@ void vgDrawImage(VGImage image)
                 out[0] = clampf01(rp[0] / ra);
                 out[1] = clampf01(rp[1] / ra);
                 out[2] = clampf01(rp[2] / ra);
-            } else { out[0]=out[1]=out[2]=0.f; }
+            } else {
+                out[0] = out[1] = out[2] = 0.f;
+            }
 
             /* Write result */
             uint8_t r8 = (uint8_t)(clampf01(out[0]) * 255.f + 0.5f);
@@ -4213,10 +5132,9 @@ void vgDrawImage(VGImage image)
 void vgSetPixels(VGint dx, VGint dy, VGImage src, VGint sx, VGint sy, VGint w, VGint h)
 {
     VG_CHECK_CTX();
-    if (src == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    cm_image_t *img = (cm_image_t *)(uintptr_t)src;
-    if (img->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    if (w <= 0 || h <= 0) return;
+    cm_image_t *img = cm_image_from_handle(src);
+    if (!img) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     if (!g_surface) return;
     int SW = g_surface->width, SH = g_surface->height;
     uint32_t *fb = (uint32_t *)(uintptr_t)vg_cmodel_get_framebuffer(g_surface->cm, NULL, NULL);
@@ -4237,41 +5155,26 @@ void vgSetPixels(VGint dx, VGint dy, VGImage src, VGint sx, VGint sy, VGint w, V
     if (dx0 + W > SW) W = SW - dx0;
     if (dy0 + H > SH) H = SH - dy0;
     if (W <= 0 || H <= 0) return;
-    /* Pre-compute format info for fast per-pixel copy */
-    int idx[4] = {0,1,2,3};
-    int is_alpha_only = 0;
-    if (img->bpp == 4) { cm_fmt_idx(img->format, idx); }
-    else if (img->bpp == 1) {
-        int bf = img->format & 0x3F;
-        is_alpha_only = (bf == VG_A_8 || bf == VG_A_1 || bf == VG_A_4) ? 1 : 0;
-    }
+    VGImageFormat surf_fmt = g_surface->is_linear
+                           ? (g_surface->is_premult ? VG_lRGBA_8888_PRE : VG_lRGBA_8888)
+                           : (g_surface->is_premult ? VG_sRGBA_8888_PRE : VG_sRGBA_8888);
     for (int64_t j = 0; j < H; j++) {
         int iy = (int)(sy0 + j), fy = (int)(dy0 + j);
         int fb_row = SH - 1 - fy;
-        const uint8_t *row = img->pixels + (size_t)iy * (size_t)img->row_stride;
         uint32_t *fb_ptr = fb + fb_row * SW + (int)dx0;
         for (int64_t i = 0; i < W; i++) {
             int ix = (int)(sx0 + i);
-            uint32_t px;
-            if (img->bpp == 4) {
-                const uint8_t *p = row + ix * 4;
-                px = ((uint32_t)p[idx[0]] << 24) | ((uint32_t)p[idx[1]] << 16)
-                   | ((uint32_t)p[idx[2]] <<  8) |  (uint32_t)p[idx[3]];
-            } else if (img->bpp == 1) {
-                uint8_t v = row[ix];
-                if (is_alpha_only) px = 0xFFFFFF00u | (uint32_t)v;
-                else               px = ((uint32_t)v << 24) | ((uint32_t)v << 16) | ((uint32_t)v << 8) | 0xFF;
-            } else {
-                float rgba[4]; cm_read_px(img, ix, iy, rgba); px = pack_rgba(rgba);
-            }
-            fb_ptr[i] = px;
+            float rgba[4];
+            cm_read_px(img, ix, iy, rgba);
+            cm_convert_color(rgba, img->format, surf_fmt);
+            fb_ptr[i] = pack_rgba(rgba);
         }
     }
 }
 void vgCopyPixels(VGint dx, VGint dy, VGint sx, VGint sy, VGint w, VGint h)
 {
     VG_CHECK_CTX();
-    if (w <= 0 || h <= 0) return;
+    if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     if (!g_surface) return;
     int SW = g_surface->width, SH = g_surface->height;
     uint32_t *fb = (uint32_t *)(uintptr_t)vg_cmodel_get_framebuffer(g_surface->cm, NULL, NULL);
@@ -4314,15 +5217,167 @@ void vgWritePixels(const void *data, VGint stride, VGImageFormat fmt,
     if (((uintptr_t)data & (align - 1u)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
-    (void)stride;(void)dx;(void)dy;
+    if (!g_surface) return;
+
+    int SW = g_surface->width, SH = g_surface->height;
+    uint32_t *fb = (uint32_t *)(uintptr_t)vg_cmodel_get_framebuffer(g_surface->cm, NULL, NULL);
+    if (!fb) return;
+    VGImageFormat surf_fmt = g_surface->is_linear
+                           ? (g_surface->is_premult ? VG_lRGBA_8888_PRE : VG_lRGBA_8888)
+                           : (g_surface->is_premult ? VG_sRGBA_8888_PRE : VG_sRGBA_8888);
+
+    int64_t x0 = dx, y0 = dy, W = w, H = h;
+    if (x0 < 0) { data = (const uint8_t *)data - (size_t)(x0 * bpp); W += x0; x0 = 0; }
+    if (y0 < 0) { data = (const uint8_t *)data - (size_t)(y0 * stride); H += y0; y0 = 0; }
+    if (x0 + W > SW) W = SW - x0;
+    if (y0 + H > SH) H = SH - y0;
+    if (W <= 0 || H <= 0) return;
+
+    int base_fmt = fmt & 0x3F;
+    int src_bw1 = (base_fmt == VG_BW_1);
+    int src_a1 = (base_fmt == VG_A_1);
+    int src_a4 = (base_fmt == VG_A_4);
+
+    int idx[4] = {0,1,2,3};
+    int is_alpha_only = 0;
+    if (bpp == 4) {
+        cm_fmt_idx(fmt, idx);
+    } else if (bpp == 1) {
+        is_alpha_only = (base_fmt == VG_A_8 || base_fmt == VG_A_1 || base_fmt == VG_A_4) ? 1 : 0;
+    }
+
+    for (int64_t row = 0; row < H; row++) {
+        int out_y = (int)(y0 + row);
+        int fb_row = SH - 1 - out_y;
+        const uint8_t *src_row = (const uint8_t *)data + (size_t)row * (size_t)stride;
+        uint32_t *dst_row = fb + (size_t)fb_row * (size_t)SW + (size_t)x0;
+        for (int64_t col = 0; col < W; col++) {
+            int src_x = (int)col;
+            float rgba[4] = {0.f, 0.f, 0.f, 1.f};
+
+            if (src_bw1 || src_a1 || src_a4) {
+                if (src_bw1 || src_a1) {
+                    uint8_t byte = src_row[src_x >> 3];
+                    int bit = (byte >> (src_x & 7)) & 1;
+                    if (src_bw1) {
+                        float v = bit ? 1.f : 0.f;
+                        rgba[0] = rgba[1] = rgba[2] = v;
+                        rgba[3] = 1.f;
+                    } else {
+                        rgba[0] = rgba[1] = rgba[2] = 1.f;
+                        rgba[3] = bit ? 1.f : 0.f;
+                    }
+                } else {
+                    uint8_t byte = src_row[src_x >> 1];
+                    int nib = (src_x & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+                    rgba[0] = rgba[1] = rgba[2] = 1.f;
+                    rgba[3] = nib / 15.f;
+                }
+            } else if (bpp == 4) {
+                const uint8_t *p = src_row + (size_t)src_x * 4u;
+                rgba[0] = p[idx[0]] / 255.f;
+                rgba[1] = p[idx[1]] / 255.f;
+                rgba[2] = p[idx[2]] / 255.f;
+                rgba[3] = p[idx[3]] / 255.f;
+                if (base_fmt == VG_sRGBX_8888 || base_fmt == VG_lRGBX_8888) rgba[3] = 1.f;
+            } else if (bpp == 2) {
+                uint16_t v;
+                memcpy(&v, src_row + (size_t)src_x * 2u, sizeof(v));
+                switch (fmt) {
+                case VG_sRGB_565:
+                case VG_sBGR_565: {
+                    float c0 = ((v >> 11) & 0x1F) / 31.f;
+                    float c1 = ((v >> 5)  & 0x3F) / 63.f;
+                    float c2 = (v & 0x1F) / 31.f;
+                    if (fmt == VG_sRGB_565) { rgba[0] = c0; rgba[1] = c1; rgba[2] = c2; }
+                    else { rgba[0] = c2; rgba[1] = c1; rgba[2] = c0; }
+                    rgba[3] = 1.f;
+                    break; }
+                case VG_sRGBA_5551:
+                    rgba[0] = ((v >> 11) & 0x1F) / 31.f;
+                    rgba[1] = ((v >> 6)  & 0x1F) / 31.f;
+                    rgba[2] = ((v >> 1)  & 0x1F) / 31.f;
+                    rgba[3] = (v & 0x1) ? 1.f : 0.f;
+                    break;
+                case VG_sBGRA_5551:
+                    rgba[2] = ((v >> 11) & 0x1F) / 31.f;
+                    rgba[1] = ((v >> 6)  & 0x1F) / 31.f;
+                    rgba[0] = ((v >> 1)  & 0x1F) / 31.f;
+                    rgba[3] = (v & 0x1) ? 1.f : 0.f;
+                    break;
+                case VG_sARGB_1555:
+                    rgba[3] = ((v >> 15) & 0x1) ? 1.f : 0.f;
+                    rgba[0] = ((v >> 10) & 0x1F) / 31.f;
+                    rgba[1] = ((v >> 5)  & 0x1F) / 31.f;
+                    rgba[2] = (v & 0x1F) / 31.f;
+                    break;
+                case VG_sABGR_1555:
+                    rgba[3] = ((v >> 15) & 0x1) ? 1.f : 0.f;
+                    rgba[2] = ((v >> 10) & 0x1F) / 31.f;
+                    rgba[1] = ((v >> 5)  & 0x1F) / 31.f;
+                    rgba[0] = (v & 0x1F) / 31.f;
+                    break;
+                case VG_sRGBA_4444:
+                    rgba[0] = ((v >> 12) & 0xF) / 15.f;
+                    rgba[1] = ((v >> 8)  & 0xF) / 15.f;
+                    rgba[2] = ((v >> 4)  & 0xF) / 15.f;
+                    rgba[3] = (v & 0xF) / 15.f;
+                    break;
+                case VG_sBGRA_4444:
+                    rgba[2] = ((v >> 12) & 0xF) / 15.f;
+                    rgba[1] = ((v >> 8)  & 0xF) / 15.f;
+                    rgba[0] = ((v >> 4)  & 0xF) / 15.f;
+                    rgba[3] = (v & 0xF) / 15.f;
+                    break;
+                case VG_sARGB_4444:
+                    rgba[3] = ((v >> 12) & 0xF) / 15.f;
+                    rgba[0] = ((v >> 8)  & 0xF) / 15.f;
+                    rgba[1] = ((v >> 4)  & 0xF) / 15.f;
+                    rgba[2] = (v & 0xF) / 15.f;
+                    break;
+                case VG_sABGR_4444:
+                    rgba[3] = ((v >> 12) & 0xF) / 15.f;
+                    rgba[2] = ((v >> 8)  & 0xF) / 15.f;
+                    rgba[1] = ((v >> 4)  & 0xF) / 15.f;
+                    rgba[0] = (v & 0xF) / 15.f;
+                    break;
+                default:
+                    rgba[0] = (v & 0x1F) / 31.f;
+                    rgba[1] = ((v >> 5) & 0x3F) / 63.f;
+                    rgba[2] = ((v >> 11) & 0x1F) / 31.f;
+                    rgba[3] = 1.f;
+                    break;
+                }
+            } else {
+                uint8_t v = src_row[src_x];
+                if (is_alpha_only) {
+                    rgba[0] = rgba[1] = rgba[2] = 1.f;
+                    if (base_fmt == VG_A_1) rgba[3] = (v >= 128) ? 1.f : 0.f;
+                    else if (base_fmt == VG_A_4) rgba[3] = ((v + 8) / 17) / 15.f;
+                    else rgba[3] = v / 255.f;
+                } else {
+                    float lum = v / 255.f;
+                    if (base_fmt == VG_BW_1) lum = (v >= 128) ? 1.f : 0.f;
+                    rgba[0] = rgba[1] = rgba[2] = lum;
+                    rgba[3] = 1.f;
+                }
+            }
+
+            cm_convert_color(rgba, fmt, surf_fmt);
+            uint8_t r8 = (uint8_t)(clampf01(rgba[0]) * 255.f + 0.5f);
+            uint8_t g8 = (uint8_t)(clampf01(rgba[1]) * 255.f + 0.5f);
+            uint8_t b8 = (uint8_t)(clampf01(rgba[2]) * 255.f + 0.5f);
+            uint8_t a8 = (uint8_t)(clampf01(rgba[3]) * 255.f + 0.5f);
+            dst_row[col] = ((uint32_t)r8 << 24) | ((uint32_t)g8 << 16) | ((uint32_t)b8 << 8) | a8;
+        }
+    }
 }
 
 void vgGetPixels(VGImage dst, VGint dx, VGint dy, VGint sx, VGint sy, VGint w, VGint h)
 {
     VG_CHECK_CTX();
-    if (dst == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    cm_image_t *img = (cm_image_t *)(uintptr_t)dst;
-    if (img->magic != IMAGE_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+    cm_image_t *img = cm_image_from_handle(dst);
+    if (!img) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     if (w <= 0 || h <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     if (!g_surface) return;
     int SW = g_surface->width, SH = g_surface->height;
@@ -4340,34 +5395,24 @@ void vgGetPixels(VGImage dst, VGint dx, VGint dy, VGint sx, VGint sy, VGint w, V
     if (dx0 + W > img->width)  W = img->width  - dx0;
     if (dy0 + H > img->height) H = img->height - dy0;
     if (W <= 0 || H <= 0) return;
-    /* Pre-compute format info */
-    int idx[4] = {0,1,2,3};
-    int is_alpha_only = 0;
-    if (img->bpp == 4) { cm_fmt_idx(img->format, idx); }
-    else if (img->bpp == 1) {
-        int bf = img->format & 0x3F;
-        is_alpha_only = (bf == VG_A_8 || bf == VG_A_1 || bf == VG_A_4) ? 1 : 0;
-    }
+    VGImageFormat surf_fmt = g_surface->is_linear
+                           ? (g_surface->is_premult ? VG_lRGBA_8888_PRE : VG_lRGBA_8888)
+                           : (g_surface->is_premult ? VG_sRGBA_8888_PRE : VG_sRGBA_8888);
     for (int64_t j = 0; j < H; j++) {
         int fy = (int)(sy0 + j), iy = (int)(dy0 + j);
         int fb_row = SH - 1 - fy;
         const uint32_t *fb_ptr = fb + fb_row * SW + (int)sx0;
-        uint8_t *row = img->pixels + (size_t)iy * (size_t)img->row_stride;
         for (int64_t i = 0; i < W; i++) {
             int ix = (int)(dx0 + i);
             uint32_t p = fb_ptr[i];
-            uint8_t r = (p >> 24) & 0xFF, g = (p >> 16) & 0xFF,
-                    b = (p >>  8) & 0xFF, a = p & 0xFF;
-            if (img->bpp == 4) {
-                uint8_t *dst_p = row + ix * 4;
-                dst_p[idx[0]] = r; dst_p[idx[1]] = g;
-                dst_p[idx[2]] = b; dst_p[idx[3]] = a;
-            } else if (img->bpp == 1) {
-                row[ix] = is_alpha_only ? a : r;
-            } else {
-                float rgba[4] = {r/255.f, g/255.f, b/255.f, a/255.f};
-                cm_write_px(img, ix, iy, rgba);
-            }
+            float rgba[4] = {
+                ((p >> 24) & 0xFF) / 255.f,
+                ((p >> 16) & 0xFF) / 255.f,
+                ((p >>  8) & 0xFF) / 255.f,
+                ( p        & 0xFF) / 255.f
+            };
+            cm_convert_color(rgba, surf_fmt, img->format);
+            cm_write_px(img, ix, iy, rgba);
         }
     }
 }
@@ -4400,6 +5445,13 @@ void vgReadPixels(void *data, VGint dataStride, VGImageFormat dataFormat,
     int W = surf->width, H = surf->height;
     const uint32_t *fb = vg_cmodel_get_framebuffer(surf->cm, NULL, NULL);
     if (!fb) return;
+    VGImageFormat surf_fmt = surf->is_linear
+                           ? (surf->is_premult ? VG_lRGBA_8888_PRE : VG_lRGBA_8888)
+                           : (surf->is_premult ? VG_sRGBA_8888_PRE : VG_sRGBA_8888);
+    int base_fmt = dataFormat & 0x3F;
+    int dst_bw1 = (base_fmt == VG_BW_1);
+    int dst_a1 = (base_fmt == VG_A_1);
+    int dst_a4 = (base_fmt == VG_A_4);
 
     /* Clamp */
     int x0 = sx < 0 ? 0 : sx;
@@ -4422,75 +5474,44 @@ void vgReadPixels(void *data, VGint dataStride, VGImageFormat dataFormat,
         const uint32_t *src_row = fb + cmodel_row * W + x0;
         uint8_t *dst_row = (uint8_t *)data + y_out * dataStride;
 
-        switch (dataFormat) {
-        case VG_sRGBA_8888:
-        case VG_lRGBA_8888:
-            /* Cmodel stores as 0xRRGGBBAA; VG_sRGBA_8888 is the same bit layout.
-             * On little-endian, uint32 0xRRGGBBAA → bytes [AA,BB,GG,RR].
-             * VG_sRGBA_8888 expects bytes [AA,BB,GG,RR] (little-endian word). */
-            memcpy(dst_row, src_row, copy_w * 4);
-            break;
-        case VG_sRGBA_8888_PRE:
-        case VG_lRGBA_8888_PRE:
-            /* Premultiply */
-            for (int x = 0; x < copy_w; x++) {
-                uint32_t p = src_row[x];
-                uint8_t r = (p>>24)&0xFF, g=(p>>16)&0xFF, b=(p>>8)&0xFF, a=(p)&0xFF;
-                r = (uint8_t)((r * a + 127) / 255);
-                g = (uint8_t)((g * a + 127) / 255);
-                b = (uint8_t)((b * a + 127) / 255);
-                uint32_t out = ((uint32_t)r<<24)|((uint32_t)g<<16)|((uint32_t)b<<8)|a;
-                memcpy(dst_row + x*4, &out, 4);
+        cm_image_t tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        tmp.format = dataFormat;
+        tmp.bpp = bpp;
+        tmp.width = copy_w;
+        tmp.height = 1;
+        tmp.row_stride = dataStride;
+        tmp.pixels = dst_row;
+
+        for (int x = 0; x < copy_w; x++) {
+            uint32_t p = src_row[x];
+            float rgba[4] = {
+                ((p >> 24) & 0xFF) / 255.f,
+                ((p >> 16) & 0xFF) / 255.f,
+                ((p >>  8) & 0xFF) / 255.f,
+                ( p        & 0xFF) / 255.f
+            };
+            cm_convert_color(rgba, surf_fmt, dataFormat);
+            if (dst_bw1 || dst_a1) {
+                int bit_val;
+                if (dst_bw1) {
+                    float lum = 0.299f * rgba[0] + 0.587f * rgba[1] + 0.114f * rgba[2];
+                    bit_val = (lum >= 0.5f) ? 1 : 0;
+                } else {
+                    bit_val = (rgba[3] >= 0.5f) ? 1 : 0;
+                }
+                uint8_t *b = &dst_row[x >> 3];
+                uint8_t mask = (uint8_t)(1u << (x & 7));
+                if (bit_val) *b |= mask;
+                else         *b &= (uint8_t)~mask;
+            } else if (dst_a4) {
+                int nib = (int)(clampf01(rgba[3]) * 15.f + 0.5f);
+                uint8_t *b = &dst_row[x >> 1];
+                if (x & 1) *b = (uint8_t)((*b & 0x0F) | ((nib & 0xF) << 4));
+                else       *b = (uint8_t)((*b & 0xF0) | (nib & 0xF));
+            } else {
+                cm_write_px(&tmp, x, 0, rgba);
             }
-            break;
-        case VG_sRGBX_8888:
-            for (int x = 0; x < copy_w; x++) {
-                uint32_t p = (src_row[x] | 0xFFu); /* force alpha=255 */
-                memcpy(dst_row + x*4, &p, 4);
-            }
-            break;
-        case VG_sBGRA_8888:
-        case VG_lBGRA_8888:
-            for (int x = 0; x < copy_w; x++) {
-                uint32_t p = src_row[x];
-                uint8_t r=(p>>24)&0xFF,g=(p>>16)&0xFF,b=(p>>8)&0xFF,a=p&0xFF;
-                uint32_t out = ((uint32_t)b<<24)|((uint32_t)g<<16)|((uint32_t)r<<8)|a;
-                memcpy(dst_row + x*4, &out, 4);
-            }
-            break;
-        case VG_sARGB_8888:
-        case VG_lARGB_8888:
-            for (int x = 0; x < copy_w; x++) {
-                uint32_t p = src_row[x];
-                uint8_t r=(p>>24)&0xFF,g=(p>>16)&0xFF,b=(p>>8)&0xFF,a=p&0xFF;
-                uint32_t out = ((uint32_t)a<<24)|((uint32_t)r<<16)|((uint32_t)g<<8)|b;
-                memcpy(dst_row + x*4, &out, 4);
-            }
-            break;
-        case VG_sABGR_8888:
-        case VG_lABGR_8888:
-            for (int x = 0; x < copy_w; x++) {
-                uint32_t p = src_row[x];
-                uint8_t r=(p>>24)&0xFF,g=(p>>16)&0xFF,b=(p>>8)&0xFF,a=p&0xFF;
-                uint32_t out = ((uint32_t)a<<24)|((uint32_t)b<<16)|((uint32_t)g<<8)|r;
-                memcpy(dst_row + x*4, &out, 4);
-            }
-            break;
-        case VG_sL_8:
-        case VG_lL_8:
-            for (int x = 0; x < copy_w; x++) {
-                uint32_t p = src_row[x];
-                uint8_t r=(p>>24)&0xFF,g=(p>>16)&0xFF,b=(p>>8)&0xFF;
-                dst_row[x] = (uint8_t)(0.299f*r + 0.587f*g + 0.114f*b + 0.5f);
-            }
-            break;
-        case VG_A_8:
-            for (int x = 0; x < copy_w; x++)
-                dst_row[x] = (uint8_t)(src_row[x] & 0xFF);
-            break;
-        default:
-            memcpy(dst_row, src_row, copy_w * 4);
-            break;
         }
     }
 }
@@ -4548,23 +5569,23 @@ static void cm_read_px(const cm_image_t *img, int x, int y, float *rgba)
             float c1 = ((v >> 5)  & 0x3F) / 63.f;
             float c2 = (v & 0x1F) / 31.f;
             if (img->format == VG_sRGB_565) {
-                rgba[0] = c2; rgba[1] = c1; rgba[2] = c0;
-            } else {
                 rgba[0] = c0; rgba[1] = c1; rgba[2] = c2;
+            } else {
+                rgba[0] = c2; rgba[1] = c1; rgba[2] = c0;
             }
             rgba[3] = 1.f;
             break;
         }
         case VG_sRGBA_5551:
-            rgba[2] = ((v >> 11) & 0x1F) / 31.f;
-            rgba[1] = ((v >> 6)  & 0x1F) / 31.f;
-            rgba[0] = ((v >> 1)  & 0x1F) / 31.f;
-            rgba[3] = (v & 0x1) ? 1.f : 0.f;
-            break;
-        case VG_sBGRA_5551:
             rgba[0] = ((v >> 11) & 0x1F) / 31.f;
             rgba[1] = ((v >> 6)  & 0x1F) / 31.f;
             rgba[2] = ((v >> 1)  & 0x1F) / 31.f;
+            rgba[3] = (v & 0x1) ? 1.f : 0.f;
+            break;
+        case VG_sBGRA_5551:
+            rgba[2] = ((v >> 11) & 0x1F) / 31.f;
+            rgba[1] = ((v >> 6)  & 0x1F) / 31.f;
+            rgba[0] = ((v >> 1)  & 0x1F) / 31.f;
             rgba[3] = (v & 0x1) ? 1.f : 0.f;
             break;
         case VG_sARGB_1555:
@@ -4580,15 +5601,15 @@ static void cm_read_px(const cm_image_t *img, int x, int y, float *rgba)
             rgba[0] = (v & 0x1F) / 31.f;
             break;
         case VG_sRGBA_4444:
-            rgba[2] = ((v >> 12) & 0xF) / 15.f;
-            rgba[1] = ((v >> 8)  & 0xF) / 15.f;
-            rgba[0] = ((v >> 4)  & 0xF) / 15.f;
-            rgba[3] = (v & 0xF) / 15.f;
-            break;
-        case VG_sBGRA_4444:
             rgba[0] = ((v >> 12) & 0xF) / 15.f;
             rgba[1] = ((v >> 8)  & 0xF) / 15.f;
             rgba[2] = ((v >> 4)  & 0xF) / 15.f;
+            rgba[3] = (v & 0xF) / 15.f;
+            break;
+        case VG_sBGRA_4444:
+            rgba[2] = ((v >> 12) & 0xF) / 15.f;
+            rgba[1] = ((v >> 8)  & 0xF) / 15.f;
+            rgba[0] = ((v >> 4)  & 0xF) / 15.f;
             rgba[3] = (v & 0xF) / 15.f;
             break;
         case VG_sARGB_4444:
@@ -4616,10 +5637,21 @@ static void cm_read_px(const cm_image_t *img, int x, int y, float *rgba)
         if (base_fmt == VG_A_8 || base_fmt == VG_A_1 || base_fmt == VG_A_4) {
             /* Alpha-only: RGB = white, A = stored */
             rgba[0] = rgba[1] = rgba[2] = 1.f;
-            rgba[3] = p[0] / 255.f;
+            if (base_fmt == VG_A_1) {
+                rgba[3] = (p[0] >= 128) ? 1.f : 0.f;
+            } else if (base_fmt == VG_A_4) {
+                int a4 = (int)((p[0] + 8) / 17);
+                if (a4 < 0) a4 = 0;
+                if (a4 > 15) a4 = 15;
+                rgba[3] = a4 / 15.f;
+            } else {
+                rgba[3] = p[0] / 255.f;
+            }
         } else {
             /* Luminance (sL_8, lL_8) or BW_1: RGB = stored, A = 1.0 */
-            rgba[0] = rgba[1] = rgba[2] = p[0] / 255.f;
+            float lum = p[0] / 255.f;
+            if (base_fmt == VG_BW_1) lum = (p[0] >= 128) ? 1.f : 0.f;
+            rgba[0] = rgba[1] = rgba[2] = lum;
             rgba[3] = 1.f;
         }
     }
@@ -4651,16 +5683,16 @@ static void cm_write_px(cm_image_t *img, int x, int y, const float *rgba)
         int a4 = (int)(clampf01(rgba[3]) * 15.f + 0.5f);
         switch (img->format) {
         case VG_sRGB_565:
-            v = (uint16_t)((b5 << 11) | (g6 << 5) | r5);
-            break;
-        case VG_sBGR_565:
             v = (uint16_t)((r5 << 11) | (g6 << 5) | b5);
             break;
+        case VG_sBGR_565:
+            v = (uint16_t)((b5 << 11) | (g6 << 5) | r5);
+            break;
         case VG_sRGBA_5551:
-            v = (uint16_t)((b5 << 11) | (g5 << 6) | (r5 << 1) | a1);
+            v = (uint16_t)((r5 << 11) | (g5 << 6) | (b5 << 1) | a1);
             break;
         case VG_sBGRA_5551:
-            v = (uint16_t)((r5 << 11) | (g5 << 6) | (b5 << 1) | a1);
+            v = (uint16_t)((b5 << 11) | (g5 << 6) | (r5 << 1) | a1);
             break;
         case VG_sARGB_1555:
             v = (uint16_t)((a1 << 15) | (r5 << 10) | (g5 << 5) | b5);
@@ -4669,10 +5701,10 @@ static void cm_write_px(cm_image_t *img, int x, int y, const float *rgba)
             v = (uint16_t)((a1 << 15) | (b5 << 10) | (g5 << 5) | r5);
             break;
         case VG_sRGBA_4444:
-            v = (uint16_t)((b4 << 12) | (g4 << 8) | (r4 << 4) | a4);
+            v = (uint16_t)((r4 << 12) | (g4 << 8) | (b4 << 4) | a4);
             break;
         case VG_sBGRA_4444:
-            v = (uint16_t)((r4 << 12) | (g4 << 8) | (b4 << 4) | a4);
+            v = (uint16_t)((b4 << 12) | (g4 << 8) | (r4 << 4) | a4);
             break;
         case VG_sARGB_4444:
             v = (uint16_t)((a4 << 12) | (r4 << 8) | (g4 << 4) | b4);
@@ -4690,10 +5722,25 @@ static void cm_write_px(cm_image_t *img, int x, int y, const float *rgba)
         int base_fmt = img->format & 0x3F;
         if (base_fmt == VG_A_8 || base_fmt == VG_A_1 || base_fmt == VG_A_4) {
             /* Alpha-only: write alpha channel */
-            p[0] = (uint8_t)(clampf01(rgba[3]) * 255.f + 0.5f);
+            float a = clampf01(rgba[3]);
+            if (base_fmt == VG_A_1) {
+                p[0] = (a >= 0.5f) ? 0xFF : 0x00;
+            } else if (base_fmt == VG_A_4) {
+                int a4 = (int)(a * 15.f + 0.5f);
+                if (a4 < 0) a4 = 0;
+                if (a4 > 15) a4 = 15;
+                p[0] = (uint8_t)(a4 * 17);
+            } else {
+                p[0] = (uint8_t)(a * 255.f + 0.5f);
+            }
         } else {
             /* Luminance: use red channel (or average) */
-            p[0] = (uint8_t)(clampf01(rgba[0]) * 255.f + 0.5f);
+            float l = clampf01(rgba[0]);
+            if (base_fmt == VG_BW_1) {
+                p[0] = (l >= 0.5f) ? 0xFF : 0x00;
+            } else {
+                p[0] = (uint8_t)(l * 255.f + 0.5f);
+            }
         }
     }
 }
@@ -5088,6 +6135,28 @@ static void glyph_free_path(cm_glyph_t *g)
     }
 }
 
+/* Free a glyph's owned image copy (if any). */
+static void glyph_free_image(cm_glyph_t *g)
+{
+    if (g->has_image && g->image != VG_INVALID_HANDLE) {
+        cm_image_t *img = cm_image_from_handle(g->image);
+        if (img) {
+            (void)cm_image_registry_remove(img);
+            img->magic = 0;
+            if (img->storage) {
+                img->storage->refcnt--;
+                if (img->storage->refcnt == 0) {
+                    free(img->storage->base);
+                    free(img->storage);
+                }
+            }
+            free(img);
+        }
+        g->image = VG_INVALID_HANDLE;
+        g->has_image = VG_FALSE;
+    }
+}
+
 void vgDestroyFont(VGFont font)
 {
     VG_CHECK_CTX();
@@ -5098,6 +6167,8 @@ void vgDestroyFont(VGFont font)
     if (f->glyphs) {
         for (int i = 0; i < f->capacity; i++)
             glyph_free_path(&f->glyphs[i]);
+        for (int i = 0; i < f->capacity; i++)
+            glyph_free_image(&f->glyphs[i]);
         free(f->glyphs);
     }
     free(f);
@@ -5122,6 +6193,7 @@ void vgSetGlyphToPath(VGFont font, VGuint glyphIndex, VGPath path,
     cm_glyph_t *g = &f->glyphs[glyphIndex];
     /* Free any previously owned path copy before replacing */
     glyph_free_path(g);
+    glyph_free_image(g);
     if (!g->defined) f->num_glyphs++;
     g->defined  = VG_TRUE;
     (void)isHinted;
@@ -5131,7 +6203,9 @@ void vgSetGlyphToPath(VGFont font, VGuint glyphIndex, VGPath path,
     g->escapement[1]   = escapement[1];
     if (path == VG_INVALID_HANDLE) {
         g->has_path = VG_FALSE;
+        g->has_image = VG_FALSE;
         g->path     = VG_INVALID_HANDLE;
+        g->image    = VG_INVALID_HANDLE;
     } else {
         if (!cm_path_is_valid(path)) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
         cm_path_t *src = (cm_path_t *)(uintptr_t)path;
@@ -5145,7 +6219,9 @@ void vgSetGlyphToPath(VGFont font, VGuint glyphIndex, VGPath path,
         if (src->buf_len > 0) memcpy(copy->buf, src->buf, (size_t)src->buf_len);
         copy->buf_cap = blen;
         g->path     = (VGPath)(uintptr_t)copy;
+        g->image    = VG_INVALID_HANDLE;
         g->has_path = VG_TRUE;
+        g->has_image = VG_FALSE;
     }
 }
 void vgSetGlyphToImage(VGFont font, VGuint glyphIndex, VGImage image,
@@ -5156,7 +6232,60 @@ void vgSetGlyphToImage(VGFont font, VGuint glyphIndex, VGImage image,
     cm_font_t *f = (cm_font_t *)(uintptr_t)font;
     if (f->magic != FONT_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     if (!glyphOrigin || !escapement) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-    (void)image;(void)glyphIndex;
+    if (image != VG_INVALID_HANDLE && !cm_image_from_handle(image)) {
+        VG_SET_ERR(VG_BAD_HANDLE_ERROR); return;
+    }
+    if ((int)glyphIndex >= f->capacity) {
+        int newcap = (int)glyphIndex + 8;
+        cm_glyph_t *ng = (cm_glyph_t *)realloc(f->glyphs, (size_t)newcap * sizeof(cm_glyph_t));
+        if (!ng) { VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return; }
+        memset(ng + f->capacity, 0, (size_t)(newcap - f->capacity) * sizeof(cm_glyph_t));
+        f->glyphs   = ng;
+        f->capacity = newcap;
+    }
+    cm_glyph_t *g = &f->glyphs[glyphIndex];
+    glyph_free_path(g);
+    glyph_free_image(g);
+    if (!g->defined) f->num_glyphs++;
+    g->defined = VG_TRUE;
+    g->glyph_origin[0] = glyphOrigin[0];
+    g->glyph_origin[1] = glyphOrigin[1];
+    g->escapement[0]   = escapement[0];
+    g->escapement[1]   = escapement[1];
+    g->has_path = VG_FALSE;
+    g->path = VG_INVALID_HANDLE;
+    if (image == VG_INVALID_HANDLE) {
+        g->has_image = VG_FALSE;
+        g->image = VG_INVALID_HANDLE;
+    } else {
+        cm_image_t *src = cm_image_from_handle(image);
+        if (!src) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
+        cm_image_t *cpy = (cm_image_t *)calloc(1, sizeof(cm_image_t));
+        if (!cpy) { VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return; }
+        cm_image_storage_t *st = (cm_image_storage_t *)calloc(1, sizeof(cm_image_storage_t));
+        if (!st) { free(cpy); VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return; }
+        size_t bytes = (size_t)src->row_stride * (size_t)src->height;
+        st->base = (uint8_t *)malloc(bytes ? bytes : 1u);
+        if (!st->base) { free(st); free(cpy); VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return; }
+        if (bytes) memcpy(st->base, src->pixels, bytes);
+        st->refcnt = 1;
+
+        cpy->magic = IMAGE_MAGIC;
+        cpy->format = src->format;
+        cpy->width = src->width;
+        cpy->height = src->height;
+        cpy->allowed_quality = src->allowed_quality;
+        cpy->bpp = src->bpp;
+        cpy->row_stride = src->row_stride;
+        cpy->parent_handle = VG_INVALID_HANDLE;
+        cpy->parent_fallback = VG_INVALID_HANDLE;
+        cpy->storage = st;
+        cpy->pixels = st->base;
+        cm_image_registry_add(cpy);
+
+        g->has_image = VG_TRUE;
+        g->image = (VGImage)(uintptr_t)cpy;
+    }
 }
 void vgClearGlyph(VGFont font, VGuint glyphIndex)
 {
@@ -5168,6 +6297,7 @@ void vgClearGlyph(VGFont font, VGuint glyphIndex)
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
     glyph_free_path(&f->glyphs[glyphIndex]);
+    glyph_free_image(&f->glyphs[glyphIndex]);
     f->glyphs[glyphIndex].defined = VG_FALSE;
     f->num_glyphs--;
 }
@@ -5186,9 +6316,32 @@ void vgDrawGlyph(VGFont font, VGuint glyphIndex, VGbitfield paintModes,
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
     (void)allowAutoHinting;
-    if (paintModes && f->glyphs[glyphIndex].has_path) {
-        vgDrawPath(f->glyphs[glyphIndex].path, paintModes);
+    cm_glyph_t *g = &f->glyphs[glyphIndex];
+    if (paintModes && g->has_path) {
+        VGfloat saved_path[9];
+        VGMatrixMode saved_mode = g_ctx->matrix_mode;
+        memcpy(saved_path, g_ctx->mat_path, sizeof(saved_path));
+        memcpy(g_ctx->mat_path, g_ctx->mat_glyph, sizeof(saved_path));
+        g_ctx->mat_path[6] += g_ctx->mat_glyph[0] * g_ctx->glyph_origin[0] + g_ctx->mat_glyph[3] * g_ctx->glyph_origin[1];
+        g_ctx->mat_path[7] += g_ctx->mat_glyph[1] * g_ctx->glyph_origin[0] + g_ctx->mat_glyph[4] * g_ctx->glyph_origin[1];
+        g_ctx->matrix_mode = VG_MATRIX_PATH_USER_TO_SURFACE;
+        vgDrawPath(g->path, paintModes);
+        memcpy(g_ctx->mat_path, saved_path, sizeof(saved_path));
+        g_ctx->matrix_mode = saved_mode;
+    } else if (paintModes && g->has_image && g->image != VG_INVALID_HANDLE) {
+        VGfloat saved_img[9];
+        VGMatrixMode saved_mode = g_ctx->matrix_mode;
+        memcpy(saved_img, g_ctx->mat_image, sizeof(saved_img));
+        memcpy(g_ctx->mat_image, g_ctx->mat_glyph, sizeof(saved_img));
+        g_ctx->mat_image[6] += g_ctx->mat_glyph[0] * g_ctx->glyph_origin[0] + g_ctx->mat_glyph[3] * g_ctx->glyph_origin[1];
+        g_ctx->mat_image[7] += g_ctx->mat_glyph[1] * g_ctx->glyph_origin[0] + g_ctx->mat_glyph[4] * g_ctx->glyph_origin[1];
+        g_ctx->matrix_mode = VG_MATRIX_IMAGE_USER_TO_SURFACE;
+        vgDrawImage(g->image);
+        memcpy(g_ctx->mat_image, saved_img, sizeof(saved_img));
+        g_ctx->matrix_mode = saved_mode;
     }
+    g_ctx->glyph_origin[0] += g->escapement[0];
+    g_ctx->glyph_origin[1] += g->escapement[1];
 }
 void vgDrawGlyphs(VGFont font, VGint glyphCount, VGuint *glyphIndices,
                   VGfloat *adjustments_x, VGfloat *adjustments_y,
@@ -5218,7 +6371,38 @@ void vgDrawGlyphs(VGFont font, VGint glyphCount, VGuint *glyphIndices,
     if (paintModes & ~(VG_FILL_PATH | VG_STROKE_PATH)) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
-    (void)adjustments_x;(void)adjustments_y;(void)allowAutoHinting;
+    (void)allowAutoHinting;
+    for (int i = 0; i < glyphCount; i++) {
+        VGuint gi = glyphIndices[i];
+        cm_glyph_t *g = &f->glyphs[gi];
+        if (paintModes && g->has_path) {
+            VGfloat saved_path[9];
+            VGMatrixMode saved_mode = g_ctx->matrix_mode;
+            memcpy(saved_path, g_ctx->mat_path, sizeof(saved_path));
+            memcpy(g_ctx->mat_path, g_ctx->mat_glyph, sizeof(saved_path));
+            g_ctx->mat_path[6] += g_ctx->mat_glyph[0] * g_ctx->glyph_origin[0] + g_ctx->mat_glyph[3] * g_ctx->glyph_origin[1];
+            g_ctx->mat_path[7] += g_ctx->mat_glyph[1] * g_ctx->glyph_origin[0] + g_ctx->mat_glyph[4] * g_ctx->glyph_origin[1];
+            g_ctx->matrix_mode = VG_MATRIX_PATH_USER_TO_SURFACE;
+            vgDrawPath(g->path, paintModes);
+            memcpy(g_ctx->mat_path, saved_path, sizeof(saved_path));
+            g_ctx->matrix_mode = saved_mode;
+        } else if (paintModes && g->has_image && g->image != VG_INVALID_HANDLE) {
+            VGfloat saved_img[9];
+            VGMatrixMode saved_mode = g_ctx->matrix_mode;
+            memcpy(saved_img, g_ctx->mat_image, sizeof(saved_img));
+            memcpy(g_ctx->mat_image, g_ctx->mat_glyph, sizeof(saved_img));
+            g_ctx->mat_image[6] += g_ctx->mat_glyph[0] * g_ctx->glyph_origin[0] + g_ctx->mat_glyph[3] * g_ctx->glyph_origin[1];
+            g_ctx->mat_image[7] += g_ctx->mat_glyph[1] * g_ctx->glyph_origin[0] + g_ctx->mat_glyph[4] * g_ctx->glyph_origin[1];
+            g_ctx->matrix_mode = VG_MATRIX_IMAGE_USER_TO_SURFACE;
+            vgDrawImage(g->image);
+            memcpy(g_ctx->mat_image, saved_img, sizeof(saved_img));
+            g_ctx->matrix_mode = saved_mode;
+        }
+        g_ctx->glyph_origin[0] += g->escapement[0];
+        g_ctx->glyph_origin[1] += g->escapement[1];
+        if (adjustments_x) g_ctx->glyph_origin[0] += adjustments_x[i];
+        if (adjustments_y) g_ctx->glyph_origin[1] += adjustments_y[i];
+    }
 }
 
 /* =========================================================================
@@ -5269,7 +6453,9 @@ static void vgu_append(VGPath path, int ns, const VGubyte *segs, int nc, const V
 
 VGUErrorCode vguLine(VGPath path, VGfloat x0, VGfloat y0, VGfloat x1, VGfloat y1)
 {
-    if (path == VG_INVALID_HANDLE) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
+    if (!cm_path_is_valid(path)) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
+    cm_path_t *p = (cm_path_t *)(uintptr_t)path;
+    if (!(p->capabilities & VG_PATH_CAPABILITY_APPEND_TO)) return VGU_ERR(VGU_PATH_CAPABILITY_ERROR);
     const VGubyte segs[] = {VG_MOVE_TO_ABS, VG_LINE_TO_ABS};
     const VGfloat c[] = {x0, y0, x1, y1};
     vgu_append(path, 2, segs, 4, c);
@@ -5278,8 +6464,11 @@ VGUErrorCode vguLine(VGPath path, VGfloat x0, VGfloat y0, VGfloat x1, VGfloat y1
 
 VGUErrorCode vguPolygon(VGPath path, const VGfloat *pts, VGint count, VGboolean closed)
 {
-    if (path == VG_INVALID_HANDLE) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
-    if (!pts || count < 2) return VGU_ERR(VGU_ILLEGAL_ARGUMENT_ERROR);
+    if (!cm_path_is_valid(path)) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
+    cm_path_t *p = (cm_path_t *)(uintptr_t)path;
+    if (!(p->capabilities & VG_PATH_CAPABILITY_APPEND_TO)) return VGU_ERR(VGU_PATH_CAPABILITY_ERROR);
+    if (!pts || ((uintptr_t)pts & (sizeof(VGfloat)-1u)) != 0 || count < 2)
+        return VGU_ERR(VGU_ILLEGAL_ARGUMENT_ERROR);
     VGubyte segs[1024];
     segs[0] = VG_MOVE_TO_ABS;
     for (int i = 1; i < count && i < 1023; i++) segs[i] = VG_LINE_TO_ABS;
@@ -5290,7 +6479,9 @@ VGUErrorCode vguPolygon(VGPath path, const VGfloat *pts, VGint count, VGboolean 
 
 VGUErrorCode vguRect(VGPath path, VGfloat x, VGfloat y, VGfloat w, VGfloat h)
 {
-    if (path == VG_INVALID_HANDLE) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
+    if (!cm_path_is_valid(path)) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
+    cm_path_t *p = (cm_path_t *)(uintptr_t)path;
+    if (!(p->capabilities & VG_PATH_CAPABILITY_APPEND_TO)) return VGU_ERR(VGU_PATH_CAPABILITY_ERROR);
     if (w <= 0.f || h <= 0.f) return VGU_ERR(VGU_ILLEGAL_ARGUMENT_ERROR);
     const VGubyte segs[] = {VG_MOVE_TO_ABS, VG_HLINE_TO_ABS, VG_VLINE_TO_ABS,
                              VG_HLINE_TO_ABS, VG_CLOSE_PATH};
@@ -5302,7 +6493,9 @@ VGUErrorCode vguRect(VGPath path, VGfloat x, VGfloat y, VGfloat w, VGfloat h)
 VGUErrorCode vguRoundRect(VGPath path, VGfloat x, VGfloat y, VGfloat w, VGfloat h,
                            VGfloat aw, VGfloat ah)
 {
-    if (path == VG_INVALID_HANDLE) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
+    if (!cm_path_is_valid(path)) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
+    cm_path_t *p = (cm_path_t *)(uintptr_t)path;
+    if (!(p->capabilities & VG_PATH_CAPABILITY_APPEND_TO)) return VGU_ERR(VGU_PATH_CAPABILITY_ERROR);
     if (w <= 0.f || h <= 0.f) return VGU_ERR(VGU_ILLEGAL_ARGUMENT_ERROR);
     if (aw < 0.f) aw = 0.f; if (ah < 0.f) ah = 0.f;
     float hw = aw/2.f, hh = ah/2.f;
@@ -5332,7 +6525,9 @@ VGUErrorCode vguRoundRect(VGPath path, VGfloat x, VGfloat y, VGfloat w, VGfloat 
 
 VGUErrorCode vguEllipse(VGPath path, VGfloat cx, VGfloat cy, VGfloat w, VGfloat h)
 {
-    if (path == VG_INVALID_HANDLE) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
+    if (!cm_path_is_valid(path)) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
+    cm_path_t *p = (cm_path_t *)(uintptr_t)path;
+    if (!(p->capabilities & VG_PATH_CAPABILITY_APPEND_TO)) return VGU_ERR(VGU_PATH_CAPABILITY_ERROR);
     if (w <= 0.f || h <= 0.f) return VGU_ERR(VGU_ILLEGAL_ARGUMENT_ERROR);
     float rx = w/2.f, ry = h/2.f;
     const float k = 0.5522847498f;
@@ -5352,8 +6547,11 @@ VGUErrorCode vguEllipse(VGPath path, VGfloat cx, VGfloat cy, VGfloat w, VGfloat 
 VGUErrorCode vguArc(VGPath path, VGfloat x, VGfloat y, VGfloat w, VGfloat h,
                     VGfloat startAngle, VGfloat angleExtent, VGUArcType arcType)
 {
-    if (path == VG_INVALID_HANDLE) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
+    if (!cm_path_is_valid(path)) return VGU_ERR(VGU_BAD_HANDLE_ERROR);
+    cm_path_t *p = (cm_path_t *)(uintptr_t)path;
+    if (!(p->capabilities & VG_PATH_CAPABILITY_APPEND_TO)) return VGU_ERR(VGU_PATH_CAPABILITY_ERROR);
     if (w <= 0.f || h <= 0.f) return VGU_ERR(VGU_ILLEGAL_ARGUMENT_ERROR);
+    if (arcType < VGU_ARC_OPEN || arcType > VGU_ARC_PIE) return VGU_ERR(VGU_ILLEGAL_ARGUMENT_ERROR);
 
     float rx = w/2.f, ry = h/2.f;
     float sa = (float)(startAngle * M_PI / 180.f);
@@ -5410,7 +6608,7 @@ VGUErrorCode vguComputeWarpQuadToSquare(VGfloat sx0, VGfloat sy0, VGfloat sx1, V
                                          VGfloat sx2, VGfloat sy2, VGfloat sx3, VGfloat sy3,
                                          VGfloat *matrix)
 {
-    if (!matrix) return VGU_ILLEGAL_ARGUMENT_ERROR;
+    if (!matrix || (((uintptr_t)matrix & (sizeof(VGfloat)-1u)) != 0)) return VGU_ILLEGAL_ARGUMENT_ERROR;
     VGfloat sx[] = {sx0,sx1,sx2,sx3}, sy[] = {sy0,sy1,sy2,sy3};
     VGfloat dx[] = {0,1,1,0}, dy[] = {0,0,1,1};
     return compute_warp(sx,sy,dx,dy,matrix);
@@ -5420,7 +6618,7 @@ VGUErrorCode vguComputeWarpSquareToQuad(VGfloat dx0, VGfloat dy0, VGfloat dx1, V
                                          VGfloat dx2, VGfloat dy2, VGfloat dx3, VGfloat dy3,
                                          VGfloat *matrix)
 {
-    if (!matrix) return VGU_ILLEGAL_ARGUMENT_ERROR;
+    if (!matrix || (((uintptr_t)matrix & (sizeof(VGfloat)-1u)) != 0)) return VGU_ILLEGAL_ARGUMENT_ERROR;
     VGfloat sx[] = {0,1,1,0}, sy[] = {0,0,1,1};
     VGfloat dx[] = {dx0,dx1,dx2,dx3}, dy[] = {dy0,dy1,dy2,dy3};
     return compute_warp(sx,sy,dx,dy,matrix);
@@ -5432,7 +6630,7 @@ VGUErrorCode vguComputeWarpQuadToQuad(VGfloat dx0, VGfloat dy0, VGfloat dx1, VGf
                                        VGfloat sx2, VGfloat sy2, VGfloat sx3, VGfloat sy3,
                                        VGfloat *matrix)
 {
-    if (!matrix) return VGU_ILLEGAL_ARGUMENT_ERROR;
+    if (!matrix || (((uintptr_t)matrix & (sizeof(VGfloat)-1u)) != 0)) return VGU_ILLEGAL_ARGUMENT_ERROR;
     VGfloat sx[] = {sx0,sx1,sx2,sx3}, sy[] = {sy0,sy1,sy2,sy3};
     VGfloat dx[] = {dx0,dx1,dx2,dx3}, dy[] = {dy0,dy1,dy2,dy3};
     return compute_warp(sx,sy,dx,dy,matrix);

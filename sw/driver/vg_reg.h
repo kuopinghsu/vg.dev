@@ -134,6 +134,13 @@
 #define VG_REG_COLOR_XFORM_5    0x244   /* bias G                           */
 #define VG_REG_COLOR_XFORM_6    0x248   /* bias B                           */
 #define VG_REG_COLOR_XFORM_7    0x24C   /* bias A                           */
+#define VG_REG_RAMP_PREMULT     0x250   /* 1 when ramp samples are premul   */
+#define VG_REG_SURF2PAINT_SX    0x254   /* surface->paint sx (float)        */
+#define VG_REG_SURF2PAINT_SHX   0x258   /* surface->paint shx               */
+#define VG_REG_SURF2PAINT_TX    0x25C   /* surface->paint tx                */
+#define VG_REG_SURF2PAINT_SHY   0x260   /* surface->paint shy               */
+#define VG_REG_SURF2PAINT_SY    0x264   /* surface->paint sy                */
+#define VG_REG_SURF2PAINT_TY    0x268   /* surface->paint ty                */
 
 /* --- Performance Counters (read-only) --- */
 #define VG_REG_PERF_CYCLES      0x300   /* Total clock cycles                */

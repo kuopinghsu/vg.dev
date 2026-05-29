@@ -24,10 +24,10 @@
 /* =========================================================================
  * Constants
  * ========================================================================= */
-#define MAX_EDGES           65536
+#define MAX_EDGES           524288
 #define MAX_TILES_X         128       /* kept for tile_w/tile_h derivation   */
 #define MAX_TILES_Y         128
-#define MAX_BAND_EDGES      16384     /* per Y-band; bands are tile_h rows   */
+#define MAX_BAND_EDGES      262144    /* per Y-band; bands are tile_h rows   */
 #define AA_N                8         /* 8x8 = 64 sub-samples                */
 #define MAX_FB_W            2048      /* upper bound on framebuffer width    */
 #define CACHE_LINE_BYTES    64
@@ -963,12 +963,20 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
             }
             float coverage = cov[px] / (float)total_samples;
 
+            uint32_t grad_type = rf_read(cm, VG_REG_GRAD_TYPE);
             RGBA_f src = eval_paint(cm, px + .5f, py + .5f);
+
             if (rf_read(cm, VG_REG_COLOR_XFORM_EN)) {
                 src.r = clampf(src.r * rf_readf(cm, VG_REG_COLOR_XFORM_0) + rf_readf(cm, VG_REG_COLOR_XFORM_4));
                 src.g = clampf(src.g * rf_readf(cm, VG_REG_COLOR_XFORM_1) + rf_readf(cm, VG_REG_COLOR_XFORM_5));
                 src.b = clampf(src.b * rf_readf(cm, VG_REG_COLOR_XFORM_2) + rf_readf(cm, VG_REG_COLOR_XFORM_6));
                 src.a = clampf(src.a * rf_readf(cm, VG_REG_COLOR_XFORM_3) + rf_readf(cm, VG_REG_COLOR_XFORM_7));
+            }
+
+            if (surf_linear && grad_type != VG_GRAD_NONE) {
+                src.r = srgb_to_linear(clampf(src.r));
+                src.g = srgb_to_linear(clampf(src.g));
+                src.b = srgb_to_linear(clampf(src.b));
             }
 
             /* Mask is folded into the coverage scalar (linear-light
@@ -1016,14 +1024,16 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
             float o_lb = r_lb * coverage + d_lb * (1.f - coverage);
             float o_a  = r.a  * coverage + dst.a * (1.f - coverage);
 
+            /* RI stores zero RGB for fully transparent non-premultiplied pixels. */
+            if (!surf_premul && o_a <= 1e-6f) {
+                o_lr = 0.f;
+                o_lg = 0.f;
+                o_lb = 0.f;
+            }
+
             float out_r = surf_linear ? clampf(o_lr) : clampf(linear_to_srgb(o_lr));
             float out_g = surf_linear ? clampf(o_lg) : clampf(linear_to_srgb(o_lg));
             float out_b = surf_linear ? clampf(o_lb) : clampf(linear_to_srgb(o_lb));
-            if (surf_premul) {
-                out_r *= clampf(o_a);
-                out_g *= clampf(o_a);
-                out_b *= clampf(o_a);
-            }
             uint8_t r8 = (uint8_t)(out_r * 255.f + .5f);
             uint8_t g8 = (uint8_t)(out_g * 255.f + .5f);
             uint8_t b8 = (uint8_t)(out_b * 255.f + .5f);
@@ -1046,6 +1056,210 @@ static RGBA_f u32_to_rgbaf(uint32_t c)
         rgba_a(c) / 255.f
     };
     return f;
+}
+
+static RGBA_f rgba_add(RGBA_f a, RGBA_f b)
+{
+    RGBA_f r = { a.r + b.r, a.g + b.g, a.b + b.b, a.a + b.a };
+    return r;
+}
+
+static RGBA_f rgba_sub(RGBA_f a, RGBA_f b)
+{
+    RGBA_f r = { a.r - b.r, a.g - b.g, a.b - b.b, a.a - b.a };
+    return r;
+}
+
+static RGBA_f rgba_scale(RGBA_f a, float s)
+{
+    RGBA_f r = { a.r * s, a.g * s, a.b * s, a.a * s };
+    return r;
+}
+
+static RGBA_f rgba_lerp(RGBA_f a, RGBA_f b, float t)
+{
+    RGBA_f r = {
+        a.r + (b.r - a.r) * t,
+        a.g + (b.g - a.g) * t,
+        a.b + (b.b - a.b) * t,
+        a.a + (b.a - a.a) * t,
+    };
+    return r;
+}
+
+static RGBA_f rgba_clamp01(RGBA_f a)
+{
+    RGBA_f r = { clampf(a.r), clampf(a.g), clampf(a.b), clampf(a.a) };
+    return r;
+}
+
+static RGBA_f ramp_stop_color(struct vg_cmodel *cm, int i)
+{
+    RGBA_f c = {
+        cm->ramp_color[i][0],
+        cm->ramp_color[i][1],
+        cm->ramp_color[i][2],
+        cm->ramp_color[i][3],
+    };
+    return c;
+}
+
+static float pos_mod(float x, float m)
+{
+    float r = fmodf(x, m);
+    if (r < 0.f) r += m;
+    return r;
+}
+
+static RGBA_f ramp_integrate(struct vg_cmodel *cm, int num_stops,
+                             float gmin, float gmax)
+{
+    RGBA_f c = (RGBA_f){0, 0, 0, 0};
+    if (gmin == 1.f || gmax == 0.f) return c;
+
+    int i = 0;
+    for (; i < num_stops - 1; i++) {
+        float s = rf_readf(cm, VG_REG_CRAMP_OFFSET(i));
+        float e = rf_readf(cm, VG_REG_CRAMP_OFFSET(i + 1));
+        if (gmin >= s && gmin < e) {
+            float g = (e > s + 1e-10f) ? ((gmin - s) / (e - s)) : 0.f;
+            RGBA_f sc = ramp_stop_color(cm, i);
+            RGBA_f ec = ramp_stop_color(cm, i + 1);
+            RGBA_f rc = rgba_lerp(sc, ec, g);
+            c = rgba_sub(c, rgba_scale(rgba_add(sc, rc), 0.5f * (gmin - s)));
+            break;
+        }
+    }
+
+    for (; i < num_stops - 1; i++) {
+        float s = rf_readf(cm, VG_REG_CRAMP_OFFSET(i));
+        float e = rf_readf(cm, VG_REG_CRAMP_OFFSET(i + 1));
+        RGBA_f sc = ramp_stop_color(cm, i);
+        RGBA_f ec = ramp_stop_color(cm, i + 1);
+        c = rgba_add(c, rgba_scale(rgba_add(sc, ec), 0.5f * (e - s)));
+
+        if (gmax >= s && gmax < e) {
+            float g = (e > s + 1e-10f) ? ((gmax - s) / (e - s)) : 0.f;
+            RGBA_f rc = rgba_lerp(sc, ec, g);
+            c = rgba_sub(c, rgba_scale(rgba_add(rc, ec), 0.5f * (e - gmax)));
+            break;
+        }
+    }
+
+    return c;
+}
+
+static RGBA_f ramp_sample_filtered(struct vg_cmodel *cm, int num_stops,
+                                   float gradient, float rho,
+                                   uint32_t spread_mode,
+                                   int ramp_premult)
+{
+    RGBA_f c = (RGBA_f){0, 0, 0, 0};
+
+    if (rho <= 0.f) {
+        float t = gradient;
+        switch (spread_mode) {
+        case 1: {
+            float g = pos_mod(t, 2.f);
+            t = (g < 1.f) ? g : (2.f - g);
+            break;
+        }
+        case 2:
+            t = t - floorf(t);
+            break;
+        default:
+            t = clampf(t);
+            break;
+        }
+
+        for (int i = 0; i < num_stops - 1; i++) {
+            float s = rf_readf(cm, VG_REG_CRAMP_OFFSET(i));
+            float e = rf_readf(cm, VG_REG_CRAMP_OFFSET(i + 1));
+            if (t >= s && t < e) {
+                float g = (e > s + 1e-10f) ? ((t - s) / (e - s)) : 0.f;
+                g = clampf(g);
+                c = rgba_lerp(ramp_stop_color(cm, i), ramp_stop_color(cm, i + 1), g);
+                goto done;
+            }
+        }
+        c = ramp_stop_color(cm, num_stops - 1);
+        goto done;
+    }
+
+    {
+        float gmin = gradient - 0.5f * rho;
+        float gmax = gradient + 0.5f * rho;
+        RGBA_f avg;
+
+        switch (spread_mode) {
+        case 1: {
+            avg = ramp_integrate(cm, num_stops, 0.f, 1.f);
+            float gmini = floorf(gmin);
+            float gmaxi = floorf(gmax);
+            c = rgba_scale(avg, gmaxi + 1.f - gmini);
+
+            if (((int)gmini) & 1) {
+                c = rgba_sub(c, ramp_integrate(cm, num_stops,
+                                               clampf(1.f - (gmin - gmini)), 1.f));
+            } else {
+                c = rgba_sub(c, ramp_integrate(cm, num_stops,
+                                               0.f, clampf(gmin - gmini)));
+            }
+
+            if (((int)gmaxi) & 1) {
+                c = rgba_sub(c, ramp_integrate(cm, num_stops,
+                                               0.f, clampf(1.f - (gmax - gmaxi))));
+            } else {
+                c = rgba_sub(c, ramp_integrate(cm, num_stops,
+                                               clampf(gmax - gmaxi), 1.f));
+            }
+            break;
+        }
+        case 2: {
+            avg = ramp_integrate(cm, num_stops, 0.f, 1.f);
+            float gmini = floorf(gmin);
+            float gmaxi = floorf(gmax);
+            c = rgba_scale(avg, gmaxi + 1.f - gmini);
+            c = rgba_sub(c, ramp_integrate(cm, num_stops,
+                                           0.f, clampf(gmin - gmini)));
+            c = rgba_sub(c, ramp_integrate(cm, num_stops,
+                                           clampf(gmax - gmaxi), 1.f));
+            break;
+        }
+        default: {
+            if (gmin < 0.f)
+                c = rgba_add(c, rgba_scale(ramp_stop_color(cm, 0), fminf(gmax, 0.f) - gmin));
+            if (gmax > 1.f)
+                c = rgba_add(c, rgba_scale(ramp_stop_color(cm, num_stops - 1),
+                                           gmax - fmaxf(gmin, 1.f)));
+            gmin = clampf(gmin);
+            gmax = clampf(gmax);
+            c = rgba_add(c, ramp_integrate(cm, num_stops, gmin, gmax));
+            c = rgba_clamp01(rgba_scale(c, 1.f / rho));
+            goto done;
+        }
+        }
+
+        c = rgba_clamp01(rgba_scale(c, 1.f / rho));
+
+        if (rho >= 0.5f) {
+            float ratio = fminf((rho - 0.5f) * 2.f, 1.f);
+            c = rgba_add(rgba_scale(avg, ratio), rgba_scale(c, 1.f - ratio));
+        }
+    }
+
+done:
+    if (ramp_premult) {
+        if (c.a > 1e-6f) {
+            float ia = 1.f / c.a;
+            c.r *= ia;
+            c.g *= ia;
+            c.b *= ia;
+        } else {
+            c.r = c.g = c.b = 0.f;
+        }
+    }
+    return c;
 }
 
 static RGBA_f eval_paint(struct vg_cmodel *cm, float px, float py)
@@ -1080,32 +1294,28 @@ static RGBA_f eval_paint(struct vg_cmodel *cm, float px, float py)
     float gy0 = rf_readf(cm, VG_REG_GRAD_Y0);
     float gx1 = rf_readf(cm, VG_REG_GRAD_X1);
     float gy1 = rf_readf(cm, VG_REG_GRAD_Y1);
+    float s2p_sx  = rf_readf(cm, VG_REG_SURF2PAINT_SX);
+    float s2p_shx = rf_readf(cm, VG_REG_SURF2PAINT_SHX);
+    float s2p_tx  = rf_readf(cm, VG_REG_SURF2PAINT_TX);
+    float s2p_shy = rf_readf(cm, VG_REG_SURF2PAINT_SHY);
+    float s2p_sy  = rf_readf(cm, VG_REG_SURF2PAINT_SY);
+    float s2p_ty  = rf_readf(cm, VG_REG_SURF2PAINT_TY);
+    float qx = s2p_sx * px + s2p_shx * py + s2p_tx;
+    float qy = s2p_shy * px + s2p_sy * py + s2p_ty;
     float t   = 0.f;
+    float rho = 0.f;
 
     if (grad_type == VG_GRAD_LINEAR) {
         float dx = gx1 - gx0, dy = gy1 - gy0;
         float len2 = dx * dx + dy * dy;
-        if (len2 > 1e-10f)
-            t = ((px - gx0) * dx + (py - gy0) * dy) / len2;
+        if (len2 > 1e-10f) {
+            t = ((qx - gx0) * dx + (qy - gy0) * dy) / len2;
+            rho = 1.f / sqrtf(len2);
+        }
     } else { /* RADIAL */
         float gr  = rf_readf(cm, VG_REG_GRAD_R);
-        float dx  = px - gx0, dy = py - gy0;
+        float dx  = qx - gx0, dy = qy - gy0;
         t = (gr > 1e-6f) ? (sqrtf(dx * dx + dy * dy) / gr) : 0.f;
-    }
-
-    /* Apply spread mode */
-    uint32_t spread = rf_read(cm, VG_REG_GRAD_SPREAD);
-    switch (spread) {
-    case 1: /* REFLECT */
-        t = fabsf(t);
-        { int ti = (int)t; t -= ti; if (ti & 1) t = 1.f - t; }
-        break;
-    case 2: /* REPEAT */
-        t = t - floorf(t);
-        break;
-    default: /* PAD */
-        t = clampf(t);
-        break;
     }
 
     /* Sample colour ramp */
@@ -1113,34 +1323,19 @@ static RGBA_f eval_paint(struct vg_cmodel *cm, float px, float py)
     RGBA_f col = {0, 0, 0, 1};
     if (num_stops == 0) return col;
 
-    float o0 = rf_readf(cm, VG_REG_CRAMP_OFFSET(0));
-    RGBA_f c0 = {
-        cm->ramp_color[0][0],
-        cm->ramp_color[0][1],
-        cm->ramp_color[0][2],
-        cm->ramp_color[0][3],
-    };
-    if (num_stops == 1 || t <= o0) return c0;
-
-    for (int i = 1; i < num_stops && i < 16; i++) {
-        float o1 = rf_readf(cm, VG_REG_CRAMP_OFFSET(i));
-        RGBA_f c1 = {
-            cm->ramp_color[i][0],
-            cm->ramp_color[i][1],
-            cm->ramp_color[i][2],
-            cm->ramp_color[i][3],
-        };
-        if (t <= o1) {
-            float f = (o1 > o0 + 1e-10f) ? ((t - o0) / (o1 - o0)) : 0.f;
-            col.r = c0.r + f * (c1.r - c0.r);
-            col.g = c0.g + f * (c1.g - c0.g);
-            col.b = c0.b + f * (c1.b - c0.b);
-            col.a = c0.a + f * (c1.a - c0.a);
-            return col;
+    int ramp_premult = (int)rf_read(cm, VG_REG_RAMP_PREMULT);
+    if (num_stops == 1) {
+        col = ramp_stop_color(cm, 0);
+        if (ramp_premult && col.a > 1e-6f) {
+            float ia = 1.f / col.a;
+            col.r *= ia; col.g *= ia; col.b *= ia;
         }
-        o0 = o1; c0 = c1;
+        return col;
     }
-    return c0;
+
+    return ramp_sample_filtered(cm, num_stops, t, rho,
+                                rf_read(cm, VG_REG_GRAD_SPREAD),
+                                ramp_premult);
 }
 
 /* =========================================================================
@@ -1299,6 +1494,7 @@ vg_cmodel_t vg_cmodel_create(uint32_t fb_width, uint32_t fb_height)
     rf_write(cm, VG_REG_SURF_LINEAR, 0);
     rf_write(cm, VG_REG_SURF_PREMULT, 0);
     rf_write(cm, VG_REG_COLOR_XFORM_EN, 0);
+    rf_write(cm, VG_REG_RAMP_PREMULT, 0);
     rf_write(cm, VG_REG_AA_SAMPLES, VG_AA_8X);
     for (int i = 0; i < 16; i++) {
         cm->ramp_color[i][0] = 0.f;
