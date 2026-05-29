@@ -77,7 +77,7 @@ typedef struct _TK_ConfigInfoRec {
 
 typedef struct _CT_DriverRec {
     VGbyte      code[10];
-    CT_Result   (*func)();
+    void       *func;
     VGuint      nsubtests;
 } CT_DriverRec;
 

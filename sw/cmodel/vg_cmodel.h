@@ -82,6 +82,7 @@ void vg_cmodel_set_path_ptr (vg_cmodel_t cm, const void *ptr, uint32_t size);
 void vg_cmodel_set_mask_ptr (vg_cmodel_t cm, const void *ptr);
 void vg_cmodel_set_image_ptr(vg_cmodel_t cm, const void *ptr,
                               uint32_t stride, uint32_t w, uint32_t h);
+void vg_cmodel_set_ramp_color(vg_cmodel_t cm, uint32_t index, const float rgba[4]);
 
 #ifdef __cplusplus
 }

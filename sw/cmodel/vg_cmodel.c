@@ -137,6 +137,8 @@ struct vg_cmodel {
     const uint8_t *path_ptr;
     uint32_t       path_size;
     const uint8_t *mask_ptr;
+
+    float          ramp_color[16][4];
 };
 
 /* =========================================================================
@@ -160,6 +162,13 @@ static inline float rf_readf(struct vg_cmodel *cm, uint32_t off)
     float f;
     memcpy(&f, &u, sizeof(f));
     return f;
+}
+
+static inline uint32_t float_to_u32(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    return u;
 }
 
 /* RGBA8888 helpers */
@@ -868,6 +877,8 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
     uint32_t fill_rule  = rf_read(cm, VG_REG_FILL_RULE);
     uint32_t blend_mode = rf_read(cm, VG_REG_BLEND_MODE);
     uint32_t aa_mode    = rf_read(cm, VG_REG_AA_SAMPLES);
+    uint32_t surf_linear = rf_read(cm, VG_REG_SURF_LINEAR);
+    uint32_t surf_premul = rf_read(cm, VG_REG_SURF_PREMULT);
 
     int sc_en = (int)rf_read(cm, VG_REG_SCISSOR_EN);
     int sc_x  = (int)rf_read(cm, VG_REG_SCISSOR_X);
@@ -953,6 +964,12 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
             float coverage = cov[px] / (float)total_samples;
 
             RGBA_f src = eval_paint(cm, px + .5f, py + .5f);
+            if (rf_read(cm, VG_REG_COLOR_XFORM_EN)) {
+                src.r = clampf(src.r * rf_readf(cm, VG_REG_COLOR_XFORM_0) + rf_readf(cm, VG_REG_COLOR_XFORM_4));
+                src.g = clampf(src.g * rf_readf(cm, VG_REG_COLOR_XFORM_1) + rf_readf(cm, VG_REG_COLOR_XFORM_5));
+                src.b = clampf(src.b * rf_readf(cm, VG_REG_COLOR_XFORM_2) + rf_readf(cm, VG_REG_COLOR_XFORM_6));
+                src.a = clampf(src.a * rf_readf(cm, VG_REG_COLOR_XFORM_3) + rf_readf(cm, VG_REG_COLOR_XFORM_7));
+            }
 
             /* Mask is folded into the coverage scalar (linear-light
              * lerp below), matching the OpenVG RI which applies mask
@@ -970,6 +987,12 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
 
             uint32_t *dst_px = &cm->fb[(uint32_t)py * cm->fb_w + (uint32_t)px];
             RGBA_f dst = u32_to_rgbaf(*dst_px);
+            if (surf_premul && dst.a > 1e-6f) {
+                float ia = 1.f / dst.a;
+                dst.r *= ia;
+                dst.g *= ia;
+                dst.b *= ia;
+            }
 
             /* Blend in the destination (sRGB) byte space, exactly like
              * the OpenVG RI does inside Color::blend.  Source is the
@@ -981,21 +1004,29 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
              * back to lRGBA_PRE before mixing by coverage, then back
              * to sRGB.  This is what makes partial-coverage / partial
              * mask pixels match RI bit-for-bit. */
-            float r_lr = srgb_to_linear(clampf(r.r));
-            float r_lg = srgb_to_linear(clampf(r.g));
-            float r_lb = srgb_to_linear(clampf(r.b));
-            float d_lr = srgb_to_linear(dst.r);
-            float d_lg = srgb_to_linear(dst.g);
-            float d_lb = srgb_to_linear(dst.b);
+            float r_lr = surf_linear ? clampf(r.r) : srgb_to_linear(clampf(r.r));
+            float r_lg = surf_linear ? clampf(r.g) : srgb_to_linear(clampf(r.g));
+            float r_lb = surf_linear ? clampf(r.b) : srgb_to_linear(clampf(r.b));
+            float d_lr = surf_linear ? clampf(dst.r) : srgb_to_linear(dst.r);
+            float d_lg = surf_linear ? clampf(dst.g) : srgb_to_linear(dst.g);
+            float d_lb = surf_linear ? clampf(dst.b) : srgb_to_linear(dst.b);
 
             float o_lr = r_lr * coverage + d_lr * (1.f - coverage);
             float o_lg = r_lg * coverage + d_lg * (1.f - coverage);
             float o_lb = r_lb * coverage + d_lb * (1.f - coverage);
             float o_a  = r.a  * coverage + dst.a * (1.f - coverage);
 
-            uint8_t r8 = (uint8_t)(clampf(linear_to_srgb(o_lr)) * 255.f + .5f);
-            uint8_t g8 = (uint8_t)(clampf(linear_to_srgb(o_lg)) * 255.f + .5f);
-            uint8_t b8 = (uint8_t)(clampf(linear_to_srgb(o_lb)) * 255.f + .5f);
+            float out_r = surf_linear ? clampf(o_lr) : clampf(linear_to_srgb(o_lr));
+            float out_g = surf_linear ? clampf(o_lg) : clampf(linear_to_srgb(o_lg));
+            float out_b = surf_linear ? clampf(o_lb) : clampf(linear_to_srgb(o_lb));
+            if (surf_premul) {
+                out_r *= clampf(o_a);
+                out_g *= clampf(o_a);
+                out_b *= clampf(o_a);
+            }
+            uint8_t r8 = (uint8_t)(out_r * 255.f + .5f);
+            uint8_t g8 = (uint8_t)(out_g * 255.f + .5f);
+            uint8_t b8 = (uint8_t)(out_b * 255.f + .5f);
             uint8_t a8 = (uint8_t)(clampf(o_a) * 255.f + .5f);
             *dst_px = rgba_pack(r8, g8, b8, a8);
         }
@@ -1022,7 +1053,13 @@ static RGBA_f eval_paint(struct vg_cmodel *cm, float px, float py)
     uint32_t grad_type = rf_read(cm, VG_REG_GRAD_TYPE);
 
     if (grad_type == VG_GRAD_NONE) {
-        return u32_to_rgbaf(rf_read(cm, VG_REG_FILL_COLOR));
+        RGBA_f f = {
+            clampf(rf_readf(cm, VG_REG_FILL_COLOR_R_F)),
+            clampf(rf_readf(cm, VG_REG_FILL_COLOR_G_F)),
+            clampf(rf_readf(cm, VG_REG_FILL_COLOR_B_F)),
+            clampf(rf_readf(cm, VG_REG_FILL_COLOR_A_F)),
+        };
+        return f;
     }
 
     if (grad_type == VG_GRAD_PATTERN) {
@@ -1077,12 +1114,22 @@ static RGBA_f eval_paint(struct vg_cmodel *cm, float px, float py)
     if (num_stops == 0) return col;
 
     float o0 = rf_readf(cm, VG_REG_CRAMP_OFFSET(0));
-    RGBA_f c0 = u32_to_rgbaf(rf_read(cm, VG_REG_CRAMP_COLOR(0)));
+    RGBA_f c0 = {
+        cm->ramp_color[0][0],
+        cm->ramp_color[0][1],
+        cm->ramp_color[0][2],
+        cm->ramp_color[0][3],
+    };
     if (num_stops == 1 || t <= o0) return c0;
 
     for (int i = 1; i < num_stops && i < 16; i++) {
         float o1 = rf_readf(cm, VG_REG_CRAMP_OFFSET(i));
-        RGBA_f c1 = u32_to_rgbaf(rf_read(cm, VG_REG_CRAMP_COLOR(i)));
+        RGBA_f c1 = {
+            cm->ramp_color[i][0],
+            cm->ramp_color[i][1],
+            cm->ramp_color[i][2],
+            cm->ramp_color[i][3],
+        };
         if (t <= o1) {
             float f = (o1 > o0 + 1e-10f) ? ((t - o0) / (o1 - o0)) : 0.f;
             col.r = c0.r + f * (c1.r - c0.r);
@@ -1245,7 +1292,20 @@ vg_cmodel_t vg_cmodel_create(uint32_t fb_width, uint32_t fb_height)
     rf_write(cm, VG_REG_MATRIX_SX,  0x3F800000u); /* 1.0f */
     rf_write(cm, VG_REG_MATRIX_SY,  0x3F800000u);
     rf_write(cm, VG_REG_BLEND_MODE, VG_REG_BLEND_SRC_OVER);
+    rf_write(cm, VG_REG_FILL_COLOR_R_F, 0);
+    rf_write(cm, VG_REG_FILL_COLOR_G_F, 0);
+    rf_write(cm, VG_REG_FILL_COLOR_B_F, 0);
+    rf_write(cm, VG_REG_FILL_COLOR_A_F, float_to_u32(1.f));
+    rf_write(cm, VG_REG_SURF_LINEAR, 0);
+    rf_write(cm, VG_REG_SURF_PREMULT, 0);
+    rf_write(cm, VG_REG_COLOR_XFORM_EN, 0);
     rf_write(cm, VG_REG_AA_SAMPLES, VG_AA_8X);
+    for (int i = 0; i < 16; i++) {
+        cm->ramp_color[i][0] = 0.f;
+        cm->ramp_color[i][1] = 0.f;
+        cm->ramp_color[i][2] = 0.f;
+        cm->ramp_color[i][3] = 1.f;
+    }
 
     return cm;
 }
@@ -1295,6 +1355,15 @@ void vg_cmodel_set_image_ptr(vg_cmodel_t cm, const void *ptr,
     cm->image_stride = stride;
     cm->image_w      = w;
     cm->image_h      = h;
+}
+
+void vg_cmodel_set_ramp_color(vg_cmodel_t cm, uint32_t index, const float rgba[4])
+{
+    if (!cm || !rgba || index >= 16) return;
+    cm->ramp_color[index][0] = rgba[0];
+    cm->ramp_color[index][1] = rgba[1];
+    cm->ramp_color[index][2] = rgba[2];
+    cm->ramp_color[index][3] = rgba[3];
 }
 
 uint32_t vg_cmodel_reg_read(vg_cmodel_t cm, uint32_t offset)

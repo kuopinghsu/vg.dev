@@ -143,7 +143,7 @@ CT_Result DriverSetupFile(CT_AppRec *pMe, VGbyte *fileName)
     }
 }
 
-static CT_Result DriverExec(CT_AppRec *pMe, CT_Result (*Func)(), VGuint subtest)
+static CT_Result DriverExec(CT_AppRec *pMe, CT_Result (*func_with_subtest)(CT_File *, VGuint), CT_Result (*func_no_subtest)(CT_File *), VGuint subtest)
 {
     CT_DriverRec *curDriver;
     CT_Result     result = CT_NO_ERROR;
@@ -160,7 +160,12 @@ static CT_Result DriverExec(CT_AppRec *pMe, CT_Result (*Func)(), VGuint subtest)
     else {
         GetAnswerFilename(pMe, AnsFile.filename, -1);
     }
-    result = (*Func)(&AnsFile, subtest);
+    if (curDriver->nsubtests > 0) {
+        result = (*func_with_subtest)(&AnsFile, subtest);
+    }
+    else {
+        result = (*func_no_subtest)(&AnsFile);
+    }
 
     if ( result == CT_NO_ERROR ) {
         if ( curDriver->nsubtests > 0 ) {
@@ -187,6 +192,20 @@ static CT_Result DriverExec(CT_AppRec *pMe, CT_Result (*Func)(), VGuint subtest)
     }
 
     return result;
+}
+
+static CT_Result DriverExecDispatch(CT_AppRec *pMe, void *func, VGuint subtest)
+{
+    CT_DriverRec *curDriver = pMe->curDriver;
+
+    if (curDriver->nsubtests > 0) {
+        CT_Result (*func_with_subtest)(CT_File *, VGuint) =
+            (CT_Result (*)(CT_File *, VGuint))func;
+        return DriverExec(pMe, func_with_subtest, NULL, subtest);
+    }
+
+    CT_Result (*func_no_subtest)(CT_File *) = (CT_Result (*)(CT_File *))func;
+    return DriverExec(pMe, NULL, func_no_subtest, subtest);
 }
 
 CT_Result Driver(CT_AppRec *pMe)
@@ -259,7 +278,7 @@ CT_Result Driver(CT_AppRec *pMe)
                 if ( vgGetError() != VG_NO_ERROR )
                     return CT_ERROR;
 
-                result = DriverExec(pMe, curDriver->func, subtest);
+                result = DriverExecDispatch(pMe, curDriver->func, subtest);
 
                 if ( result == CT_ERROR ) { 
                     pass1 = CT_ERROR;
@@ -279,7 +298,7 @@ CT_Result Driver(CT_AppRec *pMe)
             if ( vgGetError() != VG_NO_ERROR )
                 return CT_ERROR;
 
-            result = DriverExec(pMe, curDriver->func, 0);
+            result = DriverExecDispatch(pMe, curDriver->func, 0);
 
             if ( result == CT_ERROR ) { 
                 pass1 = CT_ERROR;

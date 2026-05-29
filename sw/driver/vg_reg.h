@@ -116,6 +116,25 @@
 /* --- Anti-Aliasing --- */
 #define VG_REG_AA_SAMPLES       0x210   /* 0=1x1, 1=4x4, 2=8x8              */
 
+/* --- High-precision solid paint (float RGBA) --- */
+#define VG_REG_FILL_COLOR_R_F   0x214   /* Fill color R (float)             */
+#define VG_REG_FILL_COLOR_G_F   0x218   /* Fill color G (float)             */
+#define VG_REG_FILL_COLOR_B_F   0x21C   /* Fill color B (float)             */
+#define VG_REG_FILL_COLOR_A_F   0x220   /* Fill color A (float)             */
+
+/* --- Surface interpretation for path rasterization --- */
+#define VG_REG_SURF_LINEAR      0x224   /* 0=sRGB, 1=linear RGB             */
+#define VG_REG_SURF_PREMULT     0x228   /* 0=non-premultiplied, 1=premul    */
+#define VG_REG_COLOR_XFORM_EN   0x22C   /* Apply post-sample color xform    */
+#define VG_REG_COLOR_XFORM_0    0x230   /* scale R                          */
+#define VG_REG_COLOR_XFORM_1    0x234   /* scale G                          */
+#define VG_REG_COLOR_XFORM_2    0x238   /* scale B                          */
+#define VG_REG_COLOR_XFORM_3    0x23C   /* scale A                          */
+#define VG_REG_COLOR_XFORM_4    0x240   /* bias R                           */
+#define VG_REG_COLOR_XFORM_5    0x244   /* bias G                           */
+#define VG_REG_COLOR_XFORM_6    0x248   /* bias B                           */
+#define VG_REG_COLOR_XFORM_7    0x24C   /* bias A                           */
+
 /* --- Performance Counters (read-only) --- */
 #define VG_REG_PERF_CYCLES      0x300   /* Total clock cycles                */
 #define VG_REG_PERF_EDGES       0x304   /* Edges processed                   */
