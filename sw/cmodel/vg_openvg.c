@@ -78,6 +78,7 @@ typedef struct cm_paint_s {
     VGColorRampSpreadMode spread_mode;
     VGboolean   ramp_premultiplied;
     VGTilingMode          tiling_mode;
+    struct cm_image_s    *pattern_image;
 } cm_paint_t;
 
 #define PAINT_MAGIC  0xA1B2C3D4u
@@ -192,6 +193,60 @@ typedef struct cm_image_storage_s {
     uint8_t *base;
     int      refcnt;
 } cm_image_storage_t;
+
+static void cm_free_paint_pattern(cm_paint_t *paint)
+{
+    if (!paint || !paint->pattern_image) return;
+    if (paint->pattern_image->storage) {
+        free(paint->pattern_image->storage->base);
+        free(paint->pattern_image->storage);
+    }
+    free(paint->pattern_image);
+    paint->pattern_image = NULL;
+}
+
+static cm_image_t *cm_clone_image(const cm_image_t *src)
+{
+    if (!src) return NULL;
+
+    cm_image_t *dst = (cm_image_t *)calloc(1, sizeof(cm_image_t));
+    cm_image_storage_t *storage = (cm_image_storage_t *)calloc(1, sizeof(cm_image_storage_t));
+    size_t row_stride = (size_t)src->width * (size_t)src->bpp;
+    size_t size = row_stride * (size_t)src->height;
+
+    if (!dst || !storage) {
+        free(dst);
+        free(storage);
+        return NULL;
+    }
+
+    storage->base = (uint8_t *)malloc(size ? size : 1u);
+    if (!storage->base) {
+        free(storage);
+        free(dst);
+        return NULL;
+    }
+
+    for (int y = 0; y < src->height; y++) {
+        memcpy(storage->base + (size_t)y * row_stride,
+               src->pixels + (size_t)y * (size_t)src->row_stride,
+               row_stride);
+    }
+
+    storage->refcnt = 1;
+    dst->magic = IMAGE_MAGIC;
+    dst->format = src->format;
+    dst->width = src->width;
+    dst->height = src->height;
+    dst->allowed_quality = src->allowed_quality;
+    dst->bpp = src->bpp;
+    dst->pixels = storage->base;
+    dst->row_stride = (int)row_stride;
+    dst->parent_handle = VG_INVALID_HANDLE;
+    dst->parent_fallback = VG_INVALID_HANDLE;
+    dst->storage = storage;
+    return dst;
+}
 
 /* Simple handle table – VGHandle is uintptr_t (pointer). */
 #define INVALID_HANDLE ((uintptr_t)VG_INVALID_HANDLE)
@@ -441,7 +496,339 @@ static void apply_color_transform_pre(cm_ctx_t *ctx, float c[4])
 
 static inline float img_srgb2lin(float c);
 static inline float img_lin2srgb(float c);
+static inline int fmt_is_linear(VGImageFormat fmt);
+static inline int fmt_is_premul(VGImageFormat fmt);
+static inline int fmt_is_luminance(VGImageFormat fmt);
 static void cm_convert_color(float rgba[4], VGImageFormat src_fmt, VGImageFormat dst_fmt);
+static void cm_read_tiled(const cm_image_t *img, int x, int y, VGTilingMode tm, float *rgba);
+
+typedef struct cm_paint_sampler_s {
+    cm_paint_t *paint;
+    VGfloat     surface_to_paint[9];
+    int         has_surface_to_paint;
+} cm_paint_sampler_t;
+
+static VGImageFormat cm_premul_surface_format(const cm_surface_t *surface)
+{
+    return surface && surface->is_linear ? VG_lRGBA_8888_PRE : VG_sRGBA_8888_PRE;
+}
+
+static VGImageFormat cm_rgb_equivalent_format(VGImageFormat fmt)
+{
+    if (!fmt_is_luminance(fmt)) return fmt;
+    return fmt_is_linear(fmt) ? VG_lRGBA_8888 : VG_sRGBA_8888;
+}
+
+static VGImageFormat cm_nonpremul_format(VGImageFormat fmt)
+{
+    switch (fmt) {
+    case VG_sRGBA_8888_PRE: return VG_sRGBA_8888;
+    case VG_lRGBA_8888_PRE: return VG_lRGBA_8888;
+    case VG_sARGB_8888_PRE: return VG_sARGB_8888;
+    case VG_lARGB_8888_PRE: return VG_lARGB_8888;
+    case VG_sBGRA_8888_PRE: return VG_sBGRA_8888;
+    case VG_lBGRA_8888_PRE: return VG_lBGRA_8888;
+    case VG_sABGR_8888_PRE: return VG_sABGR_8888;
+    case VG_lABGR_8888_PRE: return VG_lABGR_8888;
+    default: return fmt;
+    }
+}
+
+static void cm_unpremultiply_for_format(float rgba[4], VGImageFormat fmt)
+{
+    if (!fmt_is_premul(fmt) || rgba[3] <= 1e-6f) return;
+    float ia = 1.f / rgba[3];
+    rgba[0] *= ia;
+    rgba[1] *= ia;
+    rgba[2] *= ia;
+}
+
+static float cm_apply_spread_mode(float t, VGColorRampSpreadMode spread)
+{
+    switch (spread) {
+    case VG_COLOR_RAMP_SPREAD_PAD:
+        return clampf01(t);
+    case VG_COLOR_RAMP_SPREAD_REPEAT:
+        return t - floorf(t);
+    default: {
+        float g = fmodf(t, 2.f);
+        if (g < 0.f) g += 2.f;
+        return (g < 1.f) ? g : (2.f - g);
+    }
+    }
+}
+
+static void cm_sample_color_ramp(const cm_paint_t *paint, float gradient, float rgba[4]);
+
+static void cm_stop_color(const cm_paint_t *paint, int index, float rgba[4])
+{
+    memcpy(rgba, paint->stops[index].color, 4 * sizeof(float));
+    if (paint->ramp_premultiplied) {
+        rgba[0] *= rgba[3];
+        rgba[1] *= rgba[3];
+        rgba[2] *= rgba[3];
+    }
+}
+
+static void cm_rgba_scale(float rgba[4], float s)
+{
+    rgba[0] *= s;
+    rgba[1] *= s;
+    rgba[2] *= s;
+    rgba[3] *= s;
+}
+
+static void cm_rgba_add_scaled(float dst[4], const float src[4], float s)
+{
+    dst[0] += src[0] * s;
+    dst[1] += src[1] * s;
+    dst[2] += src[2] * s;
+    dst[3] += src[3] * s;
+}
+
+static void cm_rgba_lerp(const float a[4], const float b[4], float t, float out[4])
+{
+    out[0] = (1.f - t) * a[0] + t * b[0];
+    out[1] = (1.f - t) * a[1] + t * b[1];
+    out[2] = (1.f - t) * a[2] + t * b[2];
+    out[3] = (1.f - t) * a[3] + t * b[3];
+}
+
+static void cm_rgba_clamp(float rgba[4])
+{
+    rgba[0] = clampf01(rgba[0]);
+    rgba[1] = clampf01(rgba[1]);
+    rgba[2] = clampf01(rgba[2]);
+    rgba[3] = clampf01(rgba[3]);
+}
+
+static void cm_integrate_color_ramp(const cm_paint_t *paint, float gmin, float gmax, float rgba[4])
+{
+    rgba[0] = rgba[1] = rgba[2] = rgba[3] = 0.f;
+    if (!paint || paint->num_stops < 2 || gmin >= gmax || gmin >= 1.f || gmax <= 0.f)
+        return;
+
+    int i = 0;
+    for (; i < paint->num_stops - 1; i++) {
+        float s = paint->stops[i].offset;
+        float e = paint->stops[i + 1].offset;
+        if (gmin >= s && gmin < e && e > s) {
+            float sc[4], ec[4], rc[4];
+            float g = (gmin - s) / (e - s);
+            cm_stop_color(paint, i, sc);
+            cm_stop_color(paint, i + 1, ec);
+            cm_rgba_lerp(sc, ec, g, rc);
+            cm_rgba_add_scaled(rgba, sc, -0.5f * (gmin - s));
+            cm_rgba_add_scaled(rgba, rc, -0.5f * (gmin - s));
+            break;
+        }
+    }
+
+    for (; i < paint->num_stops - 1; i++) {
+        float s = paint->stops[i].offset;
+        float e = paint->stops[i + 1].offset;
+        float sc[4], ec[4];
+        cm_stop_color(paint, i, sc);
+        cm_stop_color(paint, i + 1, ec);
+        cm_rgba_add_scaled(rgba, sc, 0.5f * (e - s));
+        cm_rgba_add_scaled(rgba, ec, 0.5f * (e - s));
+
+        if (gmax >= s && gmax < e && e > s) {
+            float rc[4];
+            float g = (gmax - s) / (e - s);
+            cm_rgba_lerp(sc, ec, g, rc);
+            cm_rgba_add_scaled(rgba, rc, -0.5f * (e - gmax));
+            cm_rgba_add_scaled(rgba, ec, -0.5f * (e - gmax));
+            break;
+        }
+    }
+}
+
+static void cm_sample_color_ramp_filtered(const cm_paint_t *paint, float gradient, float rho, float rgba[4])
+{
+    if (!paint || paint->num_stops <= 0) {
+        rgba[0] = rgba[1] = rgba[2] = 0.f;
+        rgba[3] = 1.f;
+        return;
+    }
+
+    if (rho <= 0.f) {
+        cm_sample_color_ramp(paint, gradient, rgba);
+        return;
+    }
+
+    rgba[0] = rgba[1] = rgba[2] = rgba[3] = 0.f;
+    if (paint->spread_mode == VG_COLOR_RAMP_SPREAD_PAD) {
+        float lo[4], hi[4], mid[4];
+        cm_stop_color(paint, 0, lo);
+        cm_stop_color(paint, paint->num_stops - 1, hi);
+        float gmin = gradient - rho * 0.5f;
+        float gmax = gradient + rho * 0.5f;
+        if (gmin < 0.f)
+            cm_rgba_add_scaled(rgba, lo, fminf(gmax, 0.f) - gmin);
+        if (gmax > 1.f)
+            cm_rgba_add_scaled(rgba, hi, gmax - fmaxf(gmin, 1.f));
+        gmin = clampf01(gmin);
+        gmax = clampf01(gmax);
+        cm_integrate_color_ramp(paint, gmin, gmax, mid);
+        cm_rgba_add_scaled(rgba, mid, 1.f);
+        cm_rgba_scale(rgba, 1.f / rho);
+        cm_rgba_clamp(rgba);
+        return;
+    }
+
+    cm_sample_color_ramp(paint, gradient, rgba);
+}
+
+static void cm_sample_color_ramp(const cm_paint_t *paint, float gradient, float rgba[4])
+{
+    if (!paint || paint->num_stops <= 0) {
+        rgba[0] = rgba[1] = rgba[2] = 0.f;
+        rgba[3] = 1.f;
+        return;
+    }
+
+    gradient = cm_apply_spread_mode(gradient, paint->spread_mode);
+    for (int i = 0; i < paint->num_stops - 1; i++) {
+        float s = paint->stops[i].offset;
+        float e = paint->stops[i + 1].offset;
+        if (gradient >= s && gradient < e && e > s) {
+            float g = clampf01((gradient - s) / (e - s));
+            for (int c = 0; c < 4; c++) {
+                float sc = paint->stops[i].color[c];
+                float ec = paint->stops[i + 1].color[c];
+                if (paint->ramp_premultiplied) {
+                    if (c < 3) {
+                        sc *= paint->stops[i].color[3];
+                        ec *= paint->stops[i + 1].color[3];
+                    }
+                }
+                rgba[c] = (1.f - g) * sc + g * ec;
+            }
+            if (!paint->ramp_premultiplied) {
+                rgba[0] *= rgba[3];
+                rgba[1] *= rgba[3];
+                rgba[2] *= rgba[3];
+            }
+            return;
+        }
+    }
+
+    memcpy(rgba, paint->stops[paint->num_stops - 1].color, 4 * sizeof(float));
+    if (paint->ramp_premultiplied) {
+        rgba[0] *= rgba[3];
+        rgba[1] *= rgba[3];
+        rgba[2] *= rgba[3];
+    }
+}
+
+static void cm_init_fill_paint_sampler_for_image(cm_ctx_t *ctx, cm_paint_sampler_t *sampler)
+{
+    sampler->paint = ctx->fill_paint ? ctx->fill_paint : &g_default_fill_paint;
+    sampler->has_surface_to_paint = mat_inv_affine(ctx->mat_fill_paint, sampler->surface_to_paint);
+}
+
+static void cm_transform_point(const VGfloat *m, float x, float y, float *tx, float *ty)
+{
+    *tx = m[0] * x + m[3] * y + m[6];
+    *ty = m[1] * x + m[4] * y + m[7];
+}
+
+static void cm_apply_color_transform_for_format(cm_ctx_t *ctx, float rgba[4], VGImageFormat fmt)
+{
+    if (fmt_is_premul(fmt)) apply_color_transform_pre(ctx, rgba);
+    else apply_color_transform(ctx, rgba);
+}
+
+static void cm_sample_fill_paint(const cm_paint_sampler_t *sampler, float sx, float sy,
+                                 float rgba[4], VGImageFormat *fmt)
+{
+    const cm_paint_t *paint = sampler->paint ? sampler->paint : &g_default_fill_paint;
+    float px = sx;
+    float py = sy;
+
+    if (sampler->has_surface_to_paint)
+        cm_transform_point(sampler->surface_to_paint, sx, sy, &px, &py);
+
+    switch (paint->type) {
+    case VG_PAINT_TYPE_COLOR:
+        memcpy(rgba, paint->color_pre, 4 * sizeof(float));
+        *fmt = VG_sRGBA_8888_PRE;
+        break;
+
+    case VG_PAINT_TYPE_RADIAL_GRADIENT: {
+        float cx = paint->rad[0], cy = paint->rad[1];
+        float fx = paint->rad[2], fy = paint->rad[3];
+        float r = paint->rad[4];
+        if (r <= 0.f) {
+            cm_sample_color_ramp(paint, 1.f, rgba);
+            *fmt = VG_sRGBA_8888_PRE;
+            break;
+        }
+
+        float fpx = fx - cx;
+        float fpy = fy - cy;
+        float fp_len = sqrtf(fpx * fpx + fpy * fpy);
+        if (fp_len > 0.999f * r) {
+            float scale = 0.999f * r / fp_len;
+            fpx *= scale;
+            fpy *= scale;
+        }
+
+        float dx = (px - cx) - fpx;
+        float dy = (py - cy) - fpy;
+        float det = (px - cx) * fpy - (py - cy) * fpx;
+        float denom = (fpx * fpx + fpy * fpy) - r * r;
+        float grad = 0.f;
+        float rho = 0.f;
+        if (fabsf(denom) > 1e-20f) {
+            float disc = r * r * (dx * dx + dy * dy) - det * det;
+            if (disc < 0.f) disc = 0.f;
+            {
+                float root = sqrtf(disc);
+                float D = -1.f / denom;
+                grad = (fpx * dx + fpy * dy + root) * D;
+                if (!isnan(root) && root > 1e-20f && sampler->has_surface_to_paint) {
+                    float gx0 = sampler->surface_to_paint[0];
+                    float gx1 = sampler->surface_to_paint[1];
+                    float gy0 = sampler->surface_to_paint[3];
+                    float gy1 = sampler->surface_to_paint[4];
+                    float dgdx = D * (fpx * gx0 + fpy * gx1)
+                               + (r * r * (dx * gx0 + dy * gx1)
+                                  - (gx0 * fpy - gx1 * fpx) * det) * (D / root);
+                    float dgdy = D * (fpx * gy0 + fpy * gy1)
+                               + (r * r * (dx * gy0 + dy * gy1)
+                                  - (gy0 * fpy - gy1 * fpx) * det) * (D / root);
+                    rho = sqrtf(dgdx * dgdx + dgdy * dgdy);
+                    if (isnan(rho)) rho = 0.f;
+                }
+            }
+            if (isnan(grad)) grad = 0.f;
+        }
+
+        cm_sample_color_ramp_filtered(paint, grad, rho, rgba);
+        *fmt = VG_sRGBA_8888_PRE;
+        break;
+    }
+
+    case VG_PAINT_TYPE_PATTERN:
+        if (paint->pattern_image) {
+            int ix = (int)floorf(px);
+            int iy = (int)floorf(py);
+            cm_read_tiled(paint->pattern_image, ix, iy, paint->tiling_mode, rgba);
+            *fmt = paint->pattern_image->format;
+        } else {
+            memcpy(rgba, paint->color_pre, 4 * sizeof(float));
+            *fmt = VG_sRGBA_8888_PRE;
+        }
+        break;
+
+    default:
+        memcpy(rgba, paint->color_pre, 4 * sizeof(float));
+        *fmt = VG_sRGBA_8888_PRE;
+        break;
+    }
+}
 
 static void paint_convert_to_surface(cm_ctx_t *ctx, float c[4])
 {
@@ -1799,7 +2186,13 @@ void vgClear(VGint x, VGint y, VGint width, VGint height)
     /* Clamp to surface using overflow-safe arithmetic. */
     if (!clip_rect_i32(x, y, width, height, W, H, &x, &y, &width, &height)) return;
 
-    uint32_t col = pack_rgba(g_ctx->clear_color);
+    float clear_rgba[4] = { g_ctx->clear_color[0], g_ctx->clear_color[1],
+                            g_ctx->clear_color[2], g_ctx->clear_color[3] };
+    VGImageFormat surf_fmt = surf->is_linear
+                           ? (surf->is_premult ? VG_lRGBA_8888_PRE : VG_lRGBA_8888)
+                           : (surf->is_premult ? VG_sRGBA_8888_PRE : VG_sRGBA_8888);
+    cm_convert_color(clear_rgba, VG_sRGBA_8888, surf_fmt);
+    uint32_t col = pack_rgba(clear_rgba);
     uint32_t *fb = (uint32_t *)(uintptr_t)vg_cmodel_get_framebuffer(surf->cm, NULL, NULL);
     if (!fb) return;
 
@@ -3913,6 +4306,7 @@ void vgDestroyPaint(VGPaint paint)
         if (g_ctx->fill_paint == pt) g_ctx->fill_paint = NULL;
         if (g_ctx->stroke_paint == pt) g_ctx->stroke_paint = NULL;
     }
+    cm_free_paint_pattern(pt);
     pt->magic = 0;
     free(pt);
 }
@@ -3968,8 +4362,17 @@ void vgPaintPattern(VGPaint paint, VGImage pattern)
     VG_CHECK_CTX();
     cm_paint_t *pt = cm_paint_from_handle(paint);
     if (!pt) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    if (pattern != VG_INVALID_HANDLE && !cm_image_from_handle(pattern)) {
+    cm_image_t *img = NULL;
+    if (pattern != VG_INVALID_HANDLE) img = cm_image_from_handle(pattern);
+    if (pattern != VG_INVALID_HANDLE && !img) {
         VG_SET_ERR(VG_BAD_HANDLE_ERROR); return;
+    }
+    cm_free_paint_pattern(pt);
+    if (img) {
+        pt->pattern_image = cm_clone_image(img);
+        if (!pt->pattern_image) {
+            VG_SET_ERR(VG_OUT_OF_MEMORY_ERROR); return;
+        }
     }
     pt->type = VG_PAINT_TYPE_PATTERN;
 }
@@ -4054,7 +4457,7 @@ void vgSetParameterfv(VGHandle obj, VGint ptype, VGint count, const VGfloat *v)
 {
     if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     int vsize = vgGetParameterVectorSize(obj, ptype);
-    if (vsize <= 0) return;
+    if (ptype != VG_PAINT_COLOR_RAMP_STOPS && vsize <= 0) return;
     if (count < 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     if (count == 0) {
         if (vsize == 1) VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
@@ -4063,7 +4466,11 @@ void vgSetParameterfv(VGHandle obj, VGint ptype, VGint count, const VGfloat *v)
     if (!v || ((uintptr_t)v & (sizeof(VGfloat)-1u)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
-    if (count > vsize) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    if (ptype == VG_PAINT_COLOR_RAMP_STOPS) {
+        if (count > CM_MAX_STOPS * 5) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    } else if (count > vsize) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+    }
     cm_paint_t *pt = (cm_paint_t *)(uintptr_t)obj;
     switch (ptype) {
     case VG_PAINT_COLOR:
@@ -4159,7 +4566,7 @@ void vgSetParameteriv(VGHandle obj, VGint ptype, VGint count, const VGint *v)
 {
     if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     int vsize = vgGetParameterVectorSize(obj, ptype);
-    if (vsize <= 0) return;
+    if (ptype != VG_PAINT_COLOR_RAMP_STOPS && vsize <= 0) return;
     if (count < 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     if (count == 0) {
         if (vsize == 1) VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
@@ -4168,7 +4575,11 @@ void vgSetParameteriv(VGHandle obj, VGint ptype, VGint count, const VGint *v)
     if (!v || ((uintptr_t)v & (sizeof(VGint)-1u)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
-    if (count > vsize) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    if (ptype == VG_PAINT_COLOR_RAMP_STOPS) {
+        if (count > CM_MAX_STOPS * 5) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+    } else if (count > vsize) {
+        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+    }
     switch (ptype) {
     case VG_PAINT_COLOR:
     case VG_PAINT_LINEAR_GRADIENT:
@@ -4919,25 +5330,17 @@ void vgDrawImage(VGImage image)
     int y1 = (int)ceilf (bby1); if (y1 > SH) y1 = SH;
     if (x0 >= x1 || y0 >= y1) return;
 
-    /* Format properties */
-    int base_fmt = img->format & 0x3F;
-    /* Linear: lRGBX=7, lRGBA=8, lRGBA_PRE=9, lL_8=10 */
-    int is_linear = (base_fmt == 7 || base_fmt == 8 || base_fmt == 9 || base_fmt == 10);
-    /* Premultiplied: sRGBA_PRE=2, lRGBA_PRE=9 */
-    int is_pre    = (base_fmt == 2 || base_fmt == 9);
-
     /* Blend mode (0-based) */
     int bm = (g_ctx->blend_mode >= VG_BLEND_SRC)
              ? (int)(g_ctx->blend_mode - VG_BLEND_SRC) : 0;
 
-    /* Image mode and fill paint color */
+    VGImageFormat blend_fmt = cm_premul_surface_format(g_surface);
+
+    cm_paint_sampler_t paint_sampler;
+    cm_init_fill_paint_sampler_for_image(g_ctx, &paint_sampler);
+
+    /* Image mode */
     VGImageMode imode = g_ctx->image_mode;
-    float fp[4] = {1.f, 1.f, 1.f, 1.f};
-    if (imode != VG_DRAW_IMAGE_NORMAL) {
-        cm_paint_t *pt = g_ctx->fill_paint ? g_ctx->fill_paint : &g_default_fill_paint;
-        fp[0] = pt->color[0]; fp[1] = pt->color[1];
-        fp[2] = pt->color[2]; fp[3] = pt->color[3];
-    }
 
     for (int vy = y0; vy < y1; vy++) {
         for (int vx = x0; vx < x1; vx++) {
@@ -4966,86 +5369,99 @@ void vgDrawImage(VGImage image)
             int iy = (int)floorf(iy_f);
             if (ix < 0 || iy < 0 || ix >= IW || iy >= IH) continue;
 
-            /* Read source pixel as normalised float [0,1] */
-            float s[4];
-            cm_read_px(img, ix, iy, s);
-
-            if (base_fmt == VG_A_8 || base_fmt == VG_A_1 || base_fmt == VG_A_4) {
-                s[0] = s[1] = s[2] = s[3];
-            }
-
-            /* Match RI channel interpretation for base 16-bit packed RGB(A) formats. */
-            if (img->bpp == 2) {
-                int bf = img->format & 0x3F;
-                if (bf == VG_sRGB_565 || bf == VG_sRGBA_5551 || bf == VG_sRGBA_4444) {
-                    float t = s[0]; s[0] = s[2]; s[2] = t;
-                }
-            }
-
-            /* De-premultiply if stored premultiplied */
-            if (is_pre && s[3] > 1e-6f) {
-                float ia = 1.f / s[3];
-                s[0] *= ia; s[1] *= ia; s[2] *= ia;
-            }
-
-            /* Apply color transform and compute premultiplied source for blending.
-             * Keep the decoded components in their native space until after the
-             * image/paint transform logic, then linearize for linear surfaces. */
-
+            float sampled_image[4];
+            float sampled_paint[4];
+            float src_rgba[4];
+            VGImageFormat image_fmt = img->format;
+            VGImageFormat paint_fmt = VG_sRGBA_8888_PRE;
+            VGImageFormat src_fmt = blend_fmt;
             float sa, ar, ag, ab;
             float sp[3];
 
+            cm_read_px(img, ix, iy, sampled_image);
+
+            if (imode != VG_DRAW_IMAGE_NORMAL)
+                cm_sample_fill_paint(&paint_sampler, ix_f, iy_f, sampled_paint, &paint_fmt);
+
             if (imode == VG_DRAW_IMAGE_STENCIL) {
-                /* CT applied to PAINT, image channels act as per-channel stencil */
-                float paint[4] = { fp[0], fp[1], fp[2], fp[3] };
-                if (g_ctx->color_transform) {
-                    const VGfloat *cv = g_ctx->color_transform_values;
-                    paint[0] = clampf01(paint[0]*cv[0]+cv[4]);
-                    paint[1] = clampf01(paint[1]*cv[1]+cv[5]);
-                    paint[2] = clampf01(paint[2]*cv[2]+cv[6]);
-                    paint[3] = clampf01(paint[3]*cv[3]+cv[7]);
+                float stencil_image[4];
+                VGImageFormat stencil_fmt = fmt_is_linear(image_fmt) ? VG_lRGBA_8888_PRE : VG_sRGBA_8888_PRE;
+
+                memcpy(src_rgba, sampled_paint, sizeof(src_rgba));
+                memcpy(stencil_image, sampled_image, sizeof(stencil_image));
+                cm_convert_color(stencil_image, image_fmt, stencil_fmt);
+
+                if (fmt_is_luminance(blend_fmt) && !fmt_is_luminance(stencil_fmt)) {
+                    float lum = 0.2126f * stencil_image[0] + 0.7152f * stencil_image[1] + 0.0722f * stencil_image[2];
+                    stencil_image[0] = stencil_image[1] = stencil_image[2] = fminf(lum, stencil_image[3]);
                 }
-                float image_a = s[3];
-                /* per-channel alphas: paint_a * image_a * image_channel */
-                sa = paint[3] * image_a;
-                ar = sa * s[0];
-                ag = sa * s[1];
-                ab = sa * s[2];
-                /* premultiplied source channels: paint_channel * per-channel-alpha */
-                sp[0] = paint[0] * ar;
-                sp[1] = paint[1] * ag;
-                sp[2] = paint[2] * ab;
+
+                cm_apply_color_transform_for_format(g_ctx, src_rgba, paint_fmt);
+                cm_convert_color(src_rgba, paint_fmt, blend_fmt);
+
+                ar = src_rgba[3] * stencil_image[0];
+                ag = src_rgba[3] * stencil_image[1];
+                ab = src_rgba[3] * stencil_image[2];
+                src_rgba[0] *= stencil_image[0];
+                src_rgba[1] *= stencil_image[1];
+                src_rgba[2] *= stencil_image[2];
+                src_rgba[3] *= stencil_image[3];
             } else if (imode == VG_DRAW_IMAGE_MULTIPLY) {
-                /* CT applied to paint*image product */
-                float prod[4] = { s[0]*fp[0], s[1]*fp[1], s[2]*fp[2], s[3]*fp[3] };
-                if (g_ctx->color_transform) {
-                    const VGfloat *cv = g_ctx->color_transform_values;
-                    prod[0] = clampf01(prod[0]*cv[0]+cv[4]);
-                    prod[1] = clampf01(prod[1]*cv[1]+cv[5]);
-                    prod[2] = clampf01(prod[2]*cv[2]+cv[6]);
-                    prod[3] = clampf01(prod[3]*cv[3]+cv[7]);
+                float image_mul[4];
+                float paint_mul[4];
+                VGImageFormat image_mul_fmt = cm_nonpremul_format(image_fmt);
+
+                memcpy(image_mul, sampled_image, sizeof(image_mul));
+                memcpy(paint_mul, sampled_paint, sizeof(paint_mul));
+
+                cm_unpremultiply_for_format(image_mul, image_fmt);
+                cm_unpremultiply_for_format(paint_mul, paint_fmt);
+
+                if (!fmt_is_luminance(paint_fmt) && fmt_is_luminance(image_mul_fmt)) {
+                    cm_convert_color(image_mul, image_mul_fmt, cm_rgb_equivalent_format(image_mul_fmt));
+                    image_mul_fmt = cm_rgb_equivalent_format(image_mul_fmt);
                 }
-                sa = prod[3]; ar = ag = ab = sa;
-                sp[0]=prod[0]*sa; sp[1]=prod[1]*sa; sp[2]=prod[2]*sa;
+
+                src_rgba[0] = image_mul[0] * paint_mul[0];
+                src_rgba[1] = image_mul[1] * paint_mul[1];
+                src_rgba[2] = image_mul[2] * paint_mul[2];
+                src_rgba[3] = image_mul[3] * paint_mul[3];
+                src_fmt = image_mul_fmt;
+
+                apply_color_transform(g_ctx, src_rgba);
+                ar = ag = ab = src_rgba[3];
+                cm_convert_color(src_rgba, src_fmt, blend_fmt);
             } else {
-                /* NORMAL: CT applied to image */
-                if (g_ctx->color_transform) {
-                    const VGfloat *cv = g_ctx->color_transform_values;
-                    s[0] = clampf01(s[0]*cv[0]+cv[4]);
-                    s[1] = clampf01(s[1]*cv[1]+cv[5]);
-                    s[2] = clampf01(s[2]*cv[2]+cv[6]);
-                    s[3] = clampf01(s[3]*cv[3]+cv[7]);
+                memcpy(src_rgba, sampled_image, sizeof(src_rgba));
+
+                if (fmt_is_premul(image_fmt) && src_rgba[3] > 1e-6f) {
+                    float ia = 1.f / src_rgba[3];
+                    src_rgba[0] *= ia;
+                    src_rgba[1] *= ia;
+                    src_rgba[2] *= ia;
                 }
 
-                sa = s[3]; ar = ag = ab = sa;
-                sp[0]=s[0]*sa; sp[1]=s[1]*sa; sp[2]=s[2]*sa;
+                if (g_surface->is_linear && !fmt_is_linear(image_fmt)) {
+                    src_rgba[0] = clampf01(img_srgb2lin(src_rgba[0]));
+                    src_rgba[1] = clampf01(img_srgb2lin(src_rgba[1]));
+                    src_rgba[2] = clampf01(img_srgb2lin(src_rgba[2]));
+                } else if (!g_surface->is_linear && fmt_is_linear(image_fmt)) {
+                    src_rgba[0] = clampf01(img_lin2srgb(src_rgba[0]));
+                    src_rgba[1] = clampf01(img_lin2srgb(src_rgba[1]));
+                    src_rgba[2] = clampf01(img_lin2srgb(src_rgba[2]));
+                }
+
+                apply_color_transform(g_ctx, src_rgba);
+                ar = ag = ab = src_rgba[3];
+                src_rgba[0] *= src_rgba[3];
+                src_rgba[1] *= src_rgba[3];
+                src_rgba[2] *= src_rgba[3];
             }
 
-            if (g_surface->is_linear && !is_linear) {
-                sp[0] = clampf01(img_srgb2lin(sp[0]));
-                sp[1] = clampf01(img_srgb2lin(sp[1]));
-                sp[2] = clampf01(img_srgb2lin(sp[2]));
-            }
+            sa = src_rgba[3];
+            sp[0] = src_rgba[0];
+            sp[1] = src_rgba[1];
+            sp[2] = src_rgba[2];
 
             /* Read destination pixel from framebuffer (RGBA8888: 0xRRGGBBAA) */
             int fb_row = SH - 1 - vy;
@@ -5059,7 +5475,12 @@ void vgDrawImage(VGImage image)
             /* Porter-Duff blend matching RI: operates on premultiplied sRGB.
              * Per-channel alphas ar/ag/ab (= sa for NORMAL/MULTIPLY, differ for STENCIL). */
             float da = d[3];
-            float dp[3] = { d[0]*da, d[1]*da, d[2]*da };
+            float dp[3];
+            if (g_surface->is_premult) {
+                dp[0] = d[0]; dp[1] = d[1]; dp[2] = d[2];
+            } else {
+                dp[0] = d[0] * da; dp[1] = d[1] * da; dp[2] = d[2] * da;
+            }
             float rp[3]; float ra;
             switch (bm) {
             case 0: /* SRC */
@@ -5108,15 +5529,21 @@ void vgDrawImage(VGImage image)
             default:
                 rp[0]=sp[0]; rp[1]=sp[1]; rp[2]=sp[2]; ra=sa; break;
             }
-            /* De-premultiply for non-premul storage */
+            /* Convert blend result for surface storage mode. */
             float out[4];
             out[3] = clampf01(ra);
-            if (ra > 1e-6f) {
-                out[0] = clampf01(rp[0] / ra);
-                out[1] = clampf01(rp[1] / ra);
-                out[2] = clampf01(rp[2] / ra);
+            if (g_surface->is_premult) {
+                out[0] = clampf01(rp[0]);
+                out[1] = clampf01(rp[1]);
+                out[2] = clampf01(rp[2]);
             } else {
-                out[0] = out[1] = out[2] = 0.f;
+                if (ra > 1e-6f) {
+                    out[0] = clampf01(rp[0] / ra);
+                    out[1] = clampf01(rp[1] / ra);
+                    out[2] = clampf01(rp[2] / ra);
+                } else {
+                    out[0] = out[1] = out[2] = 0.f;
+                }
             }
 
             /* Write result */
