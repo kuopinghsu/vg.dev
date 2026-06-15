@@ -55,7 +55,9 @@
 
 typedef struct {
     float x0, y0, x1, y1;
-    int   dir;   /* +1 = upward, -1 = downward (for winding counter)        */
+    float nx, ny;  /* edge normal (for edge function evaluation) */
+    float cnst;    /* edge constant: v0.x * nx + v0.y * ny */
+    int   dir;     /* +1 = upward, -1 = downward (for winding counter) */
 } Edge;
 
 typedef struct {
@@ -144,6 +146,66 @@ struct vg_cmodel {
 /* =========================================================================
  * Helpers
  * ========================================================================= */
+typedef struct { float x, y; } vec2;
+
+static inline vec2 v2(float x, float y) { return (vec2){x, y}; }
+static inline vec2 v2_add(vec2 a, vec2 b) { return v2(a.x+b.x, a.y+b.y); }
+static inline vec2 v2_sub(vec2 a, vec2 b) { return v2(a.x-b.x, a.y-b.y); }
+static inline vec2 v2_sc(vec2 a, float s) { return v2(a.x*s, a.y*s); }
+static inline float v2_dot(vec2 a, vec2 b) { return a.x*b.x + a.y*b.y; }
+static inline float v2_len2(vec2 a) { return a.x*a.x + a.y*a.y; }
+static inline vec2 v2_perp_ccw(vec2 a) { return v2(-a.y, a.x); }
+static inline vec2 v2_perp_cw(vec2 a)  { return v2(a.y, -a.x); }
+
+static inline vec2 v2_normalize(vec2 a) {
+    float l = sqrtf(v2_len2(a));
+    return (l > 1e-10f) ? v2(a.x/l, a.y/l) : v2(0, 0);
+}
+
+/* RI-compatible unit average (non-CW overload, line 86) */
+static vec2 unit_average(vec2 u0, vec2 u1) {
+    vec2 u = v2_sc(v2_add(u0, u1), 0.5f);
+    if (v2_dot(u, u) < 0.25f) {
+        vec2 n0 = v2_perp_ccw(u0);
+        vec2 n1 = v2_perp_cw(u1);
+        u = v2_sc(v2_add(n0, n1), 0.5f);
+        if (v2_dot(n1, u0) < 0.0f)
+            u = v2_sc(u, -1.0f);
+    }
+    return v2_normalize(u);
+}
+
+/* RI-compatible CW unit average (CW overload, line 56) */
+static vec2 unit_average_cw(vec2 u0, vec2 u1, int cw) {
+    vec2 u = v2_sc(v2_add(u0, u1), 0.5f);
+    vec2 n0 = v2_perp_ccw(u0);
+    if (v2_dot(u, u) > 0.25f) {
+        if (v2_dot(n0, u1) < 0.0f)
+            u = v2_sc(u, -1.0f);
+    } else {
+        vec2 n1 = v2_perp_cw(u1);
+        u = v2_sc(v2_add(n0, n1), 0.5f);
+    }
+    if (cw) u = v2_sc(u, -1.0f);
+    return v2_normalize(u);
+}
+
+/* RI-compatible circular lerp: interpolate on unit circle via binary search.
+ * Always uses the CW overload of unitAverage (matches RI line 110/2251),
+ * which correctly handles both CW and CCW arcs. */
+static vec2 circular_lerp(vec2 u0, vec2 u1, float ratio, int cw) {
+    float l0 = 0.0f, l1 = 1.0f;
+    for (int i = 0; i < 18; i++) {
+        vec2 n = unit_average_cw(u0, u1, cw);
+        float l = 0.5f * (l0 + l1);
+        if (ratio < l) {
+            u1 = n; l1 = l;
+        } else {
+            u0 = n; l0 = l;
+        }
+    }
+    return u0;
+}
 static inline uint32_t rf_read(struct vg_cmodel *cm, uint32_t off)
 {
     if (off >= 0x400) return 0;
@@ -289,35 +351,33 @@ static void add_edge(struct vg_cmodel *cm,
     int dir = (y1 > y0) ? 1 : -1;
     if (y0 == y1) return; /* horizontal edges don't contribute */
     Edge *e = &cm->edges[cm->num_edges++];
-    e->x0 = x0; e->y0 = y0;
-    e->x1 = x1; e->y1 = y1;
+    /* Store edge with v0.y <= v1.y (matches RI) */
+    if (y0 < y1) {
+        e->x0 = x0; e->y0 = y0;
+        e->x1 = x1; e->y1 = y1;
+    } else {
+        e->x0 = x1; e->y0 = y1;
+        e->x1 = x0; e->y1 = y0;
+    }
     e->dir = dir;
+    /* Compute edge normal and constant for edge function evaluation
+     * (matches RI: n = (v0.y - v1.y, v1.x - v0.x), cnst = v0.x * n.x + v0.y * n.y)
+     * With v0.y <= v1.y, n.x = v0.y - v1.y is negative for upward edges. */
+    e->nx = e->y0 - e->y1;
+    e->ny = e->x1 - e->x0;
+    e->cnst = e->x0 * e->nx + e->y0 * e->ny;
 }
 
 /*
  * Iterative quadratic Bezier flattening using an explicit LIFO stack.
  *
  * RTL note:
- *   - The on-chip stack is a small SRAM/regfile of FLATTEN_STACK_DEPTH
- *     entries; each entry holds (x0,y0,x1,y1,x2,y2,depth) ~ 7 words.
- *   - The flatness test uses |cross|^2 < tol^2 * len^2 (not |cross|/len),
- *     avoiding any divide.  The C model still uses the algebraically
- *     equivalent dist^2 form.
- *   - On overflow (depth or stack), emit the chord as-is (graceful).
+ *   - The RI always tessellates quad/cubic curves into exactly
+ *     RI_NUM_TESSELLATED_SEGMENTS (256) line segments using uniform
+ *     parameter sampling: t = i/256.  No adaptive subdivision.
+ *   - The C-model matches this exactly for bit-identical output.
  */
-#define FLATTEN_STACK_DEPTH  24
-#define FLATTEN_MAX_DEPTH_Q  16
-#define FLATTEN_MAX_DEPTH_C  20
-
-typedef struct {
-    float x0, y0, x1, y1, x2, y2;
-    int   depth;
-} QuadFrame;
-
-typedef struct {
-    float x0, y0, x1, y1, x2, y2, x3, y3;
-    int   depth;
-} CubicFrame;
+#define TESS_SEGMENTS  256
 
 static void flatten_quad(struct vg_cmodel *cm,
                           float ix0, float iy0,
@@ -325,40 +385,17 @@ static void flatten_quad(struct vg_cmodel *cm,
                           float ix2, float iy2,
                           int depth0)
 {
-    QuadFrame stk[FLATTEN_STACK_DEPTH];
-    int sp = 0;
-    stk[sp++] = (QuadFrame){ix0, iy0, ix1, iy1, ix2, iy2, depth0};
-
-    while (sp > 0) {
-        QuadFrame f = stk[--sp];
-
-        /* Flatness: distance of control point from chord (squared form) */
-        float dx = f.x2 - f.x0, dy = f.y2 - f.y0;
-        float len2 = dx * dx + dy * dy;
-        float ex = f.x1 - f.x0, ey = f.y1 - f.y0;
-        float t   = (len2 > 1e-10f) ? ((ex * dx + ey * dy) / len2) : 0.f;
-        float cx  = f.x0 + t * dx, cy = f.y0 + t * dy;
-        float dist2 = (f.x1 - cx) * (f.x1 - cx) + (f.y1 - cy) * (f.y1 - cy);
-
-        if (f.depth > FLATTEN_MAX_DEPTH_Q || dist2 < 0.25f * 0.25f) {
-            add_edge(cm, f.x0, f.y0, f.x2, f.y2);
-            continue;
-        }
-        if (sp + 2 > FLATTEN_STACK_DEPTH) {
-            /* Stack full: emit chord and stop subdividing this branch */
-            add_edge(cm, f.x0, f.y0, f.x2, f.y2);
-            continue;
-        }
-
-        /* Midpoints (de Casteljau) */
-        float mx0 = (f.x0 + f.x1) * .5f, my0 = (f.y0 + f.y1) * .5f;
-        float mx1 = (f.x1 + f.x2) * .5f, my1 = (f.y1 + f.y2) * .5f;
-        float mx  = (mx0 + mx1) * .5f,   my  = (my0 + my1) * .5f;
-
-        /* Push right half first so left half is processed first (LIFO). */
-        stk[sp++] = (QuadFrame){mx,   my,   mx1,  my1,  f.x2, f.y2, f.depth + 1};
-        stk[sp++] = (QuadFrame){f.x0, f.y0, mx0,  my0,  mx,   my,   f.depth + 1};
+    (void)depth0;
+    float px = ix0, py = iy0;
+    for (int i = 1; i < TESS_SEGMENTS; i++) {
+        float t = (float)i / (float)TESS_SEGMENTS;
+        float u = 1.0f - t;
+        float nx = u*u * ix0 + 2.0f*t*u * ix1 + t*t * ix2;
+        float ny = u*u * iy0 + 2.0f*t*u * iy1 + t*t * iy2;
+        add_edge(cm, px, py, nx, ny);
+        px = nx; py = ny;
     }
+    add_edge(cm, px, py, ix2, iy2);
 }
 
 static void flatten_cubic(struct vg_cmodel *cm,
@@ -368,94 +405,160 @@ static void flatten_cubic(struct vg_cmodel *cm,
                            float ix3, float iy3,
                            int depth0)
 {
-    CubicFrame stk[FLATTEN_STACK_DEPTH];
-    int sp = 0;
-    stk[sp++] = (CubicFrame){ix0, iy0, ix1, iy1, ix2, iy2, ix3, iy3, depth0};
-
-    while (sp > 0) {
-        CubicFrame f = stk[--sp];
-
-        /*
-         * Flatness: |cross_i|^2 < tol^2 * len^2 (no divide / no sqrt).
-         * Equivalent to (|cross_i|/len) < tol.
-         */
-        float dx  = f.x3 - f.x0,  dy  = f.y3 - f.y0;
-        float d1x = f.x1 - f.x0,  d1y = f.y1 - f.y0;
-        float d2x = f.x2 - f.x0,  d2y = f.y2 - f.y0;
-        float len2 = dx * dx + dy * dy;
-        float c1   = d1x * dy - d1y * dx;
-        float c2   = d2x * dy - d2y * dx;
-        const float tol2 = 0.25f * 0.25f;     /* same tol as recursive version */
-
-        if (f.depth > FLATTEN_MAX_DEPTH_C ||
-            (c1 * c1 < tol2 * len2 && c2 * c2 < tol2 * len2)) {
-            add_edge(cm, f.x0, f.y0, f.x3, f.y3);
-            continue;
-        }
-        if (sp + 2 > FLATTEN_STACK_DEPTH) {
-            add_edge(cm, f.x0, f.y0, f.x3, f.y3);
-            continue;
-        }
-
-        /* de Casteljau midpoint subdivision */
-        float mx0 = (f.x0 + f.x1) * .5f, my0 = (f.y0 + f.y1) * .5f;
-        float mx1 = (f.x1 + f.x2) * .5f, my1 = (f.y1 + f.y2) * .5f;
-        float mx2 = (f.x2 + f.x3) * .5f, my2 = (f.y2 + f.y3) * .5f;
-        float nx0 = (mx0 + mx1) * .5f,   ny0 = (my0 + my1) * .5f;
-        float nx1 = (mx1 + mx2) * .5f,   ny1 = (my1 + my2) * .5f;
-        float pxm = (nx0 + nx1) * .5f,   pym = (ny0 + ny1) * .5f;
-
-        /* Push right then left (process left first). */
-        stk[sp++] = (CubicFrame){pxm,  pym,  nx1,  ny1,  mx2,  my2,  f.x3, f.y3, f.depth + 1};
-        stk[sp++] = (CubicFrame){f.x0, f.y0, mx0,  my0,  nx0,  ny0,  pxm,  pym,  f.depth + 1};
+    (void)depth0;
+    float px = ix0, py = iy0;
+    for (int i = 1; i < TESS_SEGMENTS; i++) {
+        float t = (float)i / (float)TESS_SEGMENTS;
+        float t2 = t * t, t3 = t2 * t;
+        float nx = (1.0f - 3.0f*t + 3.0f*t2 - t3) * ix0
+                 + (3.0f*t - 6.0f*t2 + 3.0f*t3) * ix1
+                 + (3.0f*t2 - 3.0f*t3) * ix2
+                 + t3 * ix3;
+        float ny = (1.0f - 3.0f*t + 3.0f*t2 - t3) * iy0
+                 + (3.0f*t - 6.0f*t2 + 3.0f*t3) * iy1
+                 + (3.0f*t2 - 3.0f*t3) * iy2
+                 + t3 * iy3;
+        add_edge(cm, px, py, nx, ny);
+        px = nx; py = ny;
     }
+    add_edge(cm, px, py, ix3, iy3);
 }
 
-/* Simple arc approximation: subdivide into cubic Bezier segments */
+/* RI-compatible arc tessellation: direct unit circle interpolation */
 static void flatten_arc(struct vg_cmodel *cm,
                          float cx, float cy,
                          float rx, float ry,
                          float angle_start, float angle_end,
                          float rot_deg)
 {
-    /* Approximate each arc quadrant with a cubic Bezier */
-    float rot = rot_deg * (float)M_PI / 180.f;
+    (void)cx; (void)cy; (void)rx; (void)ry;
+    (void)angle_start; (void)angle_end; (void)rot_deg;
+
+    /* The arc parameters are already converted to cubic Bezier control
+     * points by the caller (fe_process_path). We just emit the 256-segment
+     * flattening of each cubic segment.  This function is called once per
+     * arc segment, and the caller passes the cubic control points. */
+}
+
+/* RI-compatible arc tessellation: direct unit circle interpolation.
+ * Receives path-space start/end points. Outputs edges in screen space
+ * by applying the path-to-surface matrix. */
+static void arc_tessellate_ri(struct vg_cmodel *cm,
+                               float start_x, float start_y,
+                               float rh, float rv, float rot_deg,
+                               float end_x, float end_y,
+                               int large_arc, int sweep,
+                               float mat_sx, float mat_shx, float mat_tx,
+                               float mat_shy, float mat_sy, float mat_ty)
+{
+    rh = fabsf(rh);
+    rv = fabsf(rv);
+    if (rh < 1e-10f || rv < 1e-10f) {
+        /* Degenerate ellipse: fall back to a line (matches RI) */
+        vec2 s_pt = v2(mat_sx*start_x + mat_shx*start_y + mat_tx,
+                        mat_shy*start_x + mat_sy*start_y + mat_ty);
+        vec2 e_pt = v2(mat_sx*end_x + mat_shx*end_y + mat_tx,
+                        mat_shy*end_x + mat_sy*end_y + mat_ty);
+        add_edge(cm, s_pt.x, s_pt.y, e_pt.x, e_pt.y);
+        return;
+    }
+
+    float rot = rot_deg * (float)M_PI / 180.0f;
     float cos_r = cosf(rot), sin_r = sinf(rot);
 
-    int segs = (int)(ceilf(fabsf(angle_end - angle_start) / ((float)M_PI / 2.f)));
-    if (segs < 1) segs = 1;
-    float da = (angle_end - angle_start) / segs;
-    float k = (4.f / 3.f) * tanf(da / 4.f);
+    /* unitCircleToEllipse matrix (matches RI exactly) */
+    float m00 = cos_r * rh, m01 = -sin_r * rv;
+    float m10 = sin_r * rh, m11 =  cos_r * rv;
 
-    float prev_x, prev_y;
-    {
-        float a = angle_start;
-        float px = cosf(a) * rx, py = sinf(a) * ry;
-        prev_x = cx + px * cos_r - py * sin_r;
-        prev_y = cy + px * sin_r + py * cos_r;
+    /* Inverse (ellipseToUnitCircle) */
+    float det = m00 * m11 - m01 * m10;
+    if (fabsf(det) < 1e-20f) return;
+    float inv = 1.0f / det;
+    float i00 =  m11 * inv, i01 = -m01 * inv;
+    float i10 = -m10 * inv, i11 =  m00 * inv;
+
+    /* Transform start and end to unit circle space (like RI's affineTransform) */
+    vec2 u0 = v2(i00 * start_x + i01 * start_y,
+                  i10 * start_x + i11 * start_y);
+    vec2 u1 = v2(i00 * end_x   + i01 * end_y,
+                  i10 * end_x   + i11 * end_y);
+
+    /* Solve for center on unit circle (matches RI's findEllipses) */
+    vec2 m = v2_sc(v2_add(u0, u1), 0.5f);
+    vec2 d = v2_sub(u0, u1);
+    float lsq = v2_dot(d, d);
+    if (lsq <= 0.0f) return;
+
+    float disc = 1.0f / lsq - 0.25f;
+    if (disc < 0.0f) {
+        /* Scale axes to make solution possible (matches RI) */
+        float l = sqrtf(lsq);
+        rh *= 0.5f * l;
+        rv *= 0.5f * l;
+
+        /* Redo with scaled axes */
+        float cr2 = cosf(rot), sr2 = sinf(rot);
+        m00 = cr2*rh; m01 = -sr2*rv;
+        m10 = sr2*rh; m11 =  cr2*rv;
+        det = m00*m11 - m01*m10;
+        if (fabsf(det) < 1e-20f) return;
+        inv = 1.0f / det;
+        i00 =  m11*inv; i01 = -m01*inv;
+        i10 = -m10*inv; i11 =  m00*inv;
+        u0 = v2(i00*start_x + i01*start_y, i10*start_x + i11*start_y);
+        u1 = v2(i00*end_x   + i01*end_y,   i10*end_x   + i11*end_y);
+        d = v2_sub(u0, u1);
+        m = v2_sc(v2_add(u0, u1), 0.5f);
+        lsq = v2_dot(d, d);
+        if (lsq <= 0.0f) return;
+        disc = fmaxf(0.0f, 1.0f/lsq - 0.25f);
     }
 
-    for (int i = 0; i < segs; i++) {
-        float a0 = angle_start + da * i;
-        float a1 = a0 + da;
-        float c0  = cosf(a0), s0 = sinf(a0);
-        float c1  = cosf(a1), s1 = sinf(a1);
+    if (v2_len2(v2_sub(u0, u1)) < 1e-20f) return;
 
-        float p1x = (c0 - k * s0) * rx, p1y = (s0 + k * c0) * ry;
-        float p2x = (c1 + k * s1) * rx, p2y = (s1 - k * c1) * ry;
-        float p3x = c1 * rx, p3y = s1 * ry;
+    vec2 sd = v2_sc(d, sqrtf(disc));
+    vec2 sp = v2_perp_cw(sd);
+    vec2 c0 = v2_add(m, sp);
+    vec2 c1 = v2_sub(m, sp);
 
-        /* Rotate by rot */
-        float t1x = cx + p1x * cos_r - p1y * sin_r;
-        float t1y = cy + p1x * sin_r + p1y * cos_r;
-        float t2x = cx + p2x * cos_r - p2y * sin_r;
-        float t2y = cy + p2x * sin_r + p2y * cos_r;
-        float t3x = cx + p3x * cos_r - p3y * sin_r;
-        float t3y = cy + p3x * sin_r + p3y * cos_r;
+    /* Choose center and direction (matches RI exactly) */
+    /* RI: cp = c1 if (SCWARC_TO || LCCWARC_TO), else c0 */
+    /* SCWARC: large=0 sweep=1, SCCWARC: large=0 sweep=0 */
+    /* LCWARC: large=1 sweep=1, LCCWARC: large=1 sweep=0 */
+    /* So cp=c1 when large_arc XOR sweep */
+    vec2 cp = (large_arc != sweep) ? c1 : c0;
+    int cw = sweep ? 1 : 0;
 
-        flatten_cubic(cm, prev_x, prev_y, t1x, t1y, t2x, t2y, t3x, t3y, 0);
-        prev_x = t3x; prev_y = t3y;
+    /* Move unit circle origin to center */
+    u0 = v2_sub(u0, cp);
+    u1 = v2_sub(u1, cp);
+
+    if (v2_len2(u0) < 1e-10f || v2_len2(u1) < 1e-10f) return;
+
+    /* Transform center back to original space (matches RI) */
+    vec2 center = v2(m00*cp.x + m01*cp.y, m10*cp.x + m11*cp.y);
+
+    /* Tessellate: 256 segments on unit circle, then transform to path space,
+     * then to screen space */
+    vec2 pp_path = v2(start_x, start_y);
+    vec2 pp = v2(mat_sx*pp_path.x + mat_shx*pp_path.y + mat_tx,
+                  mat_shy*pp_path.x + mat_sy*pp_path.y + mat_ty);
+    for (int i = 1; i < TESS_SEGMENTS; i++) {
+        float t = (float)i / (float)TESS_SEGMENTS;
+        vec2 pn_circle = circular_lerp(u0, u1, t, cw);
+        /* Transform to path space: center + unitCircleToEllipse * pn */
+        vec2 pn_path = v2_add(center, v2(m00*pn_circle.x + m01*pn_circle.y,
+                                           m10*pn_circle.x + m11*pn_circle.y));
+        /* Transform to screen space */
+        vec2 pn = v2(mat_sx*pn_path.x + mat_shx*pn_path.y + mat_tx,
+                      mat_shy*pn_path.x + mat_sy*pn_path.y + mat_ty);
+        add_edge(cm, pp.x, pp.y, pn.x, pn.y);
+        pp = pn;
     }
+    vec2 pe_path = v2(end_x, end_y);
+    vec2 pe = v2(mat_sx*pe_path.x + mat_shx*pe_path.y + mat_tx,
+                  mat_shy*pe_path.x + mat_sy*pe_path.y + mat_ty);
+    add_edge(cm, pp.x, pp.y, pe.x, pe.y);
 }
 
 /* =========================================================================
@@ -646,41 +749,28 @@ static void fe_process_path(struct vg_cmodel *cm)
         case VG_PATH_CMD_SCWARC_TO:
         case VG_PATH_CMD_LCCWARC_TO:
         case VG_PATH_CMD_LCWARC_TO: {
-            float rh  = RF_RAW();
-            float rv  = RF_RAW();
-            float rot = RF_RAW();
-            float ex  = RF() + ox;
-            float ey  = RF() + oy;
-            /* Endpoint-to-centre arc conversion in path space */
-            float rot_r = rot * (float)M_PI / 180.f;
-            float cos_r = cosf(-rot_r), sin_r = sinf(-rot_r);
-            float mx = (pcur_x - ex) * .5f, my = (pcur_y - ey) * .5f;
-            float x1p = cos_r * mx + sin_r * my;
-            float y1p = -sin_r * mx + cos_r * my;
-            float x1p2 = x1p * x1p, y1p2 = y1p * y1p;
-            float rh2 = rh * rh, rv2 = rv * rv;
-            float sq = (rh2 * rv2 - rh2 * y1p2 - rv2 * x1p2) /
-                       (rh2 * y1p2 + rv2 * x1p2);
-            if (sq < 0.f) sq = 0.f;
-            float fac = sqrtf(sq);
+            float arh  = RF_RAW();
+            float arv  = RF_RAW();
+            float arot = RF_RAW();
+            float aex  = RF() + ox;
+            float aey  = RF() + oy;
             int large  = (seg == VG_PATH_CMD_LCCWARC_TO || seg == VG_PATH_CMD_LCWARC_TO);
             int sweep  = (seg == VG_PATH_CMD_SCWARC_TO  || seg == VG_PATH_CMD_LCWARC_TO);
-            if (large == sweep) fac = -fac;
-            float cxp = fac * rh * y1p / rv;
-            float cyp = -fac * rv * x1p / rh;
-            float cx_ = cos_r * cxp - sin_r * cyp + (pcur_x + ex) * .5f;
-            float cy_ = sin_r * cxp + cos_r * cyp + (pcur_y + ey) * .5f;
-            float theta1 = atan2f((y1p - cyp) / rv, (x1p - cxp) / rh);
-            float theta2 = atan2f((-y1p - cyp) / rv, (-x1p - cxp) / rh);
-            if (!sweep && theta2 > theta1) theta2 -= 2.f * (float)M_PI;
-            if ( sweep && theta2 < theta1) theta2 += 2.f * (float)M_PI;
-            /* Transform ellipse centre */
-            float tcx, tcy;
-            transform_pt(sx, shx, tx, shy, sy, ty, cx_, cy_, &tcx, &tcy);
-            flatten_arc(cm, tcx, tcy, rh, rv, theta1, theta2, rot);
-            transform_pt(sx, shx, tx, shy, sy, ty, ex, ey, &tx0, &ty0);
-            pcur_x = ex; pcur_y = ey;
-            cur_x = tx0; cur_y = ty0;
+            /* Transform start and end points */
+            float tsx, tsy, tex, tey;
+            transform_pt(sx, shx, tx, shy, sy, ty, pcur_x, pcur_y, &tsx, &tsy);
+            transform_pt(sx, shx, tx, shy, sy, ty, aex, aey, &tex, &tey);
+            /* Apply path-to-surface rotation to the arc rotation angle */
+            float path_rot = atan2f(shy, sx);
+            float total_rot = arot + path_rot * 180.0f / (float)M_PI;
+            /* Scale radii by the matrix scale */
+            float scale_x = sqrtf(sx*sx + shy*shy);
+            float scale_y = sqrtf(shx*shx + sy*sy);
+            arc_tessellate_ri(cm, pcur_x, pcur_y, arh * scale_x, arv * scale_y,
+                              total_rot, aex, aey, large, sweep,
+                              sx, shx, tx, shy, sy, ty);
+            pcur_x = aex; pcur_y = aey;
+            cur_x = tex; cur_y = tey;
             subpath_open = 1;
             break;
         }
@@ -815,7 +905,7 @@ static int id_fifo_pop(struct vg_cmodel *cm)
  *     For each pixel with non-zero coverage: paint, mask, blend, write.
  * ========================================================================= */
 
-typedef struct { float xi; int dir; } Intercept;
+typedef struct { int eid; } Intercept;
 
 /* RGBA float colour (definition repeated near paint code for locality). */
 typedef struct { float r, g, b, a; } RGBA_f;
@@ -843,28 +933,11 @@ static inline float linear_to_srgb(float c)
 
 static int edge_active_at_y(const Edge *e, float y)
 {
-    float ymin = fminf(e->y0, e->y1);
-    float ymax = fmaxf(e->y0, e->y1);
-    /*
-     * CTS_TOP_RIGHT rule (matches OpenVG RI): lower boundary INCLUSIVE.
-     *   y > ymin  (exclude screen-top)  &&  y <= ymax  (include screen-bottom).
-     */
-    return (y > ymin && y <= ymax);
+    /* RI uses: sp.y >= v0.y && sp.y < v1.y (with v0.y <= v1.y) */
+    return (y >= e->y0 && y < e->y1);
 }
 
-/* Small insertion sort.  N typically <= a few dozen even for tiger. */
-static void sort_intercepts(Intercept *a, int n)
-{
-    for (int i = 1; i < n; i++) {
-        Intercept k = a[i];
-        int j = i - 1;
-        while (j >= 0 && a[j].xi > k.xi) {
-            a[j + 1] = a[j];
-            j--;
-        }
-        a[j + 1] = k;
-    }
-}
+/* Edge function evaluation approach - no sorting needed */
 
 static void rasterize_band(struct vg_cmodel *cm, int ty,
                             Intercept *ints_scratch)
@@ -879,6 +952,7 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
     uint32_t aa_mode    = rf_read(cm, VG_REG_AA_SAMPLES);
     uint32_t surf_linear = rf_read(cm, VG_REG_SURF_LINEAR);
     uint32_t surf_premul = rf_read(cm, VG_REG_SURF_PREMULT);
+    uint32_t surf_alpha  = rf_read(cm, VG_REG_SURF_ALPHA_BITS);
 
     int sc_en = (int)rf_read(cm, VG_REG_SCISSOR_EN);
     int sc_x  = (int)rf_read(cm, VG_REG_SCISSOR_X);
@@ -889,9 +963,10 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
     int   n_sub;
     float radius;
     if (aa_mode == VG_AA_NONE) { n_sub = 1;     radius = 0.f;  }
-    else                       { n_sub = AA_N;  radius = 0.5f; }
+    else if (aa_mode == VG_AA_4X) { n_sub = 8;  radius = 0.5f; } /* 8-queen */
+    else                       { n_sub = 8;  radius = 0.5f; }
     float step          = (n_sub > 1) ? (2.f * radius / (float)n_sub) : 0.f;
-    int   total_samples = n_sub * n_sub;
+    int   total_samples = n_sub;
     /* Per-pixel sub-sample inside-counter for the current pixel-row.    */
     /* Stored as float to avoid an extra int->float conversion later.    */
     float *cov = cm->cov_row;
@@ -900,6 +975,8 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
         /* Reset per-row coverage accumulator. */
         for (int i = 0; i < fb_w; i++) cov[i] = 0.f;
 
+        /* 8-queen sampling pattern (matches RI's FASTER quality) */
+        static const int queen_x[8] = {3, 7, 0, 2, 5, 1, 6, 4};
         for (int sy = 0; sy < n_sub; sy++) {
             float spy = (n_sub == 1)
                             ? ((float)py + 0.5f)
@@ -917,32 +994,34 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
             while ((eid = id_fifo_pop(cm)) >= 0) {
                 const Edge *e = &cm->edges[eid];
                 if (!edge_active_at_y(e, spy)) continue;
-                float t  = (spy - e->y0) / (e->y1 - e->y0);
-                float xi = e->x0 + t * (e->x1 - e->x0);
-                ints_scratch[n_ints].xi  = xi;
-                ints_scratch[n_ints].dir = e->dir;
+                ints_scratch[n_ints].eid = eid;
                 n_ints++;
             }
 
-            /* (2) Sort by x */
-            sort_intercepts(ints_scratch, n_ints);
-
-            /* (3) March pixel columns L->R, advancing intercept index. */
-            int winding = 0;
-            int idx     = 0;
+            /* (2) Evaluate edge functions for each sampling point. */
             for (int px = 0; px < fb_w; px++) {
                 int row_inside = 0;
                 for (int sx = 0; sx < n_sub; sx++) {
+                    /* 8-queen sample position */
                     float spx = (n_sub == 1)
                                     ? ((float)px + 0.5f)
-                                    : ((float)px + 0.5f - radius + ((float)sx + 0.5f) * step);
-                    /*
-                     * CTS_TOP_RIGHT left-boundary inclusive: cross at xi
-                     * counts when xi <= spx.
-                     */
-                    while (idx < n_ints && ints_scratch[idx].xi <= spx) {
-                        winding += ints_scratch[idx].dir;
-                        idx++;
+                                    : ((float)px + 0.5f - radius + ((float)queen_x[sx] + 0.5f) * step);
+                    float spy2 = spy;  /* spy already computed above */
+
+                    /* Evaluate edge functions for all active edges (matches RI) */
+                    int winding = 0;
+                    for (int ei = 0; ei < n_ints; ei++) {
+                        const Edge *e = &cm->edges[ints_scratch[ei].eid];
+                        /* Check if sampling point is within edge's y-range */
+                        float eymin = fminf(e->y0, e->y1);
+                        float eymax = fmaxf(e->y0, e->y1);
+                        if (spy2 > eymin && spy2 <= eymax) {
+                            /* Evaluate edge function: side = sp.x * n.x + sp.y * n.y - cnst */
+                            float side = spx * e->nx + spy2 * e->ny - e->cnst;
+                            if (side <= 0.0f) {
+                                winding += e->dir;
+                            }
+                        }
                     }
                     int inside = (fill_rule == VG_REG_FILL_EVEN_ODD)
                                      ? (abs(winding) & 1)
@@ -995,6 +1074,8 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
 
             uint32_t *dst_px = &cm->fb[(uint32_t)py * cm->fb_w + (uint32_t)px];
             RGBA_f dst = u32_to_rgbaf(*dst_px);
+            /* RI convention: configs with alphaBits=0 unpack alpha as 1.0 */
+            if (surf_alpha == 0) dst.a = 1.0f;
             if (surf_premul && dst.a > 1e-6f) {
                 float ia = 1.f / dst.a;
                 dst.r *= ia;
@@ -1038,6 +1119,8 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
             uint8_t g8 = (uint8_t)(out_g * 255.f + .5f);
             uint8_t b8 = (uint8_t)(out_b * 255.f + .5f);
             uint8_t a8 = (uint8_t)(clampf(o_a) * 255.f + .5f);
+            /* RI convention: configs with alphaBits=0 store alpha=0xFF */
+            if (surf_alpha == 0) a8 = 0xFF;
             *dst_px = rgba_pack(r8, g8, b8, a8);
         }
     }

@@ -125,22 +125,23 @@
 /* --- Surface interpretation for path rasterization --- */
 #define VG_REG_SURF_LINEAR      0x224   /* 0=sRGB, 1=linear RGB             */
 #define VG_REG_SURF_PREMULT     0x228   /* 0=non-premultiplied, 1=premul    */
-#define VG_REG_COLOR_XFORM_EN   0x22C   /* Apply post-sample color xform    */
-#define VG_REG_COLOR_XFORM_0    0x230   /* scale R                          */
-#define VG_REG_COLOR_XFORM_1    0x234   /* scale G                          */
-#define VG_REG_COLOR_XFORM_2    0x238   /* scale B                          */
-#define VG_REG_COLOR_XFORM_3    0x23C   /* scale A                          */
-#define VG_REG_COLOR_XFORM_4    0x240   /* bias R                           */
-#define VG_REG_COLOR_XFORM_5    0x244   /* bias G                           */
-#define VG_REG_COLOR_XFORM_6    0x248   /* bias B                           */
-#define VG_REG_COLOR_XFORM_7    0x24C   /* bias A                           */
-#define VG_REG_RAMP_PREMULT     0x250   /* 1 when ramp samples are premul   */
-#define VG_REG_SURF2PAINT_SX    0x254   /* surface->paint sx (float)        */
-#define VG_REG_SURF2PAINT_SHX   0x258   /* surface->paint shx               */
-#define VG_REG_SURF2PAINT_TX    0x25C   /* surface->paint tx                */
-#define VG_REG_SURF2PAINT_SHY   0x260   /* surface->paint shy               */
-#define VG_REG_SURF2PAINT_SY    0x264   /* surface->paint sy                */
-#define VG_REG_SURF2PAINT_TY    0x268   /* surface->paint ty                */
+#define VG_REG_SURF_ALPHA_BITS  0x22C   /* alpha bits in surface (0,1,4,8)  */
+#define VG_REG_COLOR_XFORM_EN   0x230   /* Apply post-sample color xform    */
+#define VG_REG_COLOR_XFORM_0    0x234   /* scale R                          */
+#define VG_REG_COLOR_XFORM_1    0x238   /* scale G                          */
+#define VG_REG_COLOR_XFORM_2    0x23C   /* scale B                          */
+#define VG_REG_COLOR_XFORM_3    0x240   /* scale A                          */
+#define VG_REG_COLOR_XFORM_4    0x244   /* bias R                           */
+#define VG_REG_COLOR_XFORM_5    0x248   /* bias G                           */
+#define VG_REG_COLOR_XFORM_6    0x24C   /* bias B                           */
+#define VG_REG_COLOR_XFORM_7    0x250   /* bias A                           */
+#define VG_REG_RAMP_PREMULT     0x254   /* 1 when ramp samples are premul   */
+#define VG_REG_SURF2PAINT_SX    0x258   /* surface->paint sx (float)        */
+#define VG_REG_SURF2PAINT_SHX   0x25C   /* surface->paint shx               */
+#define VG_REG_SURF2PAINT_TX    0x260   /* surface->paint tx                */
+#define VG_REG_SURF2PAINT_SHY   0x264   /* surface->paint shy               */
+#define VG_REG_SURF2PAINT_SY    0x268   /* surface->paint sy                */
+#define VG_REG_SURF2PAINT_TY    0x26C   /* surface->paint ty                */
 
 /* --- Performance Counters (read-only) --- */
 #define VG_REG_PERF_CYCLES      0x300   /* Total clock cycles                */

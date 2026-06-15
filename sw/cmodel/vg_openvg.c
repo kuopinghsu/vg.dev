@@ -256,6 +256,8 @@ typedef struct cm_surface_s {
     int          width, height;
     int          is_linear;   /* 0=sRGB  1=linear */
     int          is_premult;  /* 0=non-pre  1=pre */
+    int          config_id;   /* EGL config ID */
+    int          alpha_bits;  /* alpha channel bits (0,1,4,8) */
     uint8_t     *mask_buf;    /* alpha8 mask buffer, row 0 = top, NULL if not allocated */
 } cm_surface_t;
 
@@ -1020,16 +1022,88 @@ static void ctx_init_defaults(cm_ctx_t *ctx, cm_surface_t *surface)
 }
 
 /* =========================================================================
- * EGL implementation
+ * EGL implementation – supports all 30 RI configs
  * ========================================================================= */
 
-/* We expose a single EGL config:
- *   R8G8B8A8, sRGB, non-premultiplied, EGL_PBUFFER_BIT, ID=1
- * This maps to the CTS directory prefix "1/sRGB_NONPRE/".
- */
-#define CM_EGL_CONFIG_ID    1
-#define CM_EGL_CONFIG       ((EGLConfig)(uintptr_t)CM_EGL_CONFIG_ID)
-#define CM_EGL_DISPLAY      ((EGLDisplay)1)
+#define CM_EGL_DISPLAY  ((EGLDisplay)1)
+
+/* Config structure matching the RI's RIEGLConfig */
+typedef struct {
+    int r, g, b, a, l;    /* channel bits */
+    int bpp;               /* bits per pixel */
+    int samples;           /* MSAA samples (1, 4, or 32) */
+    int maskBits;          /* alpha mask bits */
+    int id;                /* config ID (1-based) */
+    int colorBufferType;   /* EGL_RGB_BUFFER or EGL_LUMINANCE_BUFFER */
+} cm_egl_config_t;
+
+static const cm_egl_config_t g_configs[] = {
+    /*  R   G   B   A   L  bpp  s  M  ID  buftype */
+    {   8,  8,  8,  8,  0, 32,  1, 8,  1, 1 },  /* RGB888, A8 */
+    {   8,  8,  8,  0,  0, 32,  1, 8,  2, 1 },  /* RGB888 */
+    {   5,  5,  5,  1,  0, 16,  1, 4,  3, 1 },  /* RGB555, A1 */
+    {   5,  6,  5,  0,  0, 16,  1, 4,  4, 1 },  /* RGB565 */
+    {   4,  4,  4,  4,  0, 16,  1, 4,  5, 1 },  /* RGB444, A4 */
+    {   0,  0,  0,  8,  0,  8,  1, 8,  6, 1 },  /* A8 */
+    {   0,  0,  0,  4,  0,  4,  1, 4,  7, 1 },  /* A4 */
+    {   0,  0,  0,  1,  0,  1,  1, 1,  8, 1 },  /* A1 */
+    {   0,  0,  0,  0,  8,  8,  1, 8,  9, 2 },  /* L8 */
+    {   0,  0,  0,  0,  1,  1,  1, 1, 10, 2 },  /* L1 */
+    {   8,  8,  8,  8,  0, 32,  4, 1, 11, 1 },  /* RGB888, A8, 4xMSAA */
+    {   8,  8,  8,  0,  0, 32,  4, 1, 12, 1 },  /* RGB888, 4xMSAA */
+    {   5,  5,  5,  1,  0, 16,  4, 1, 13, 1 },  /* RGB555, A1, 4xMSAA */
+    {   5,  6,  5,  0,  0, 16,  4, 1, 14, 1 },  /* RGB565, 4xMSAA */
+    {   4,  4,  4,  4,  0, 16,  4, 1, 15, 1 },  /* RGB444, A4, 4xMSAA */
+    {   0,  0,  0,  8,  0,  8,  4, 1, 16, 1 },  /* A8, 4xMSAA */
+    {   0,  0,  0,  4,  0,  4,  4, 1, 17, 1 },  /* A4, 4xMSAA */
+    {   0,  0,  0,  1,  0,  1,  4, 1, 18, 1 },  /* A1, 4xMSAA */
+    {   0,  0,  0,  0,  8,  8,  4, 1, 19, 2 },  /* L8, 4xMSAA */
+    {   0,  0,  0,  0,  1,  1,  4, 1, 20, 2 },  /* L1, 4xMSAA */
+    {   8,  8,  8,  8,  0, 32, 32, 1, 21, 1 },  /* RGB888, A8, 32xMSAA */
+    {   8,  8,  8,  0,  0, 32, 32, 1, 22, 1 },  /* RGB888, 32xMSAA */
+    {   5,  5,  5,  1,  0, 16, 32, 1, 23, 1 },  /* RGB555, A1, 32xMSAA */
+    {   5,  6,  5,  0,  0, 16, 32, 1, 24, 1 },  /* RGB565, 32xMSAA */
+    {   4,  4,  4,  4,  0, 16, 32, 1, 25, 1 },  /* RGB444, A4, 32xMSAA */
+    {   0,  0,  0,  8,  0,  8, 32, 1, 26, 1 },  /* A8, 32xMSAA */
+    {   0,  0,  0,  4,  0,  4, 32, 1, 27, 1 },  /* A4, 32xMSAA */
+    {   0,  0,  0,  1,  0,  1, 32, 1, 28, 1 },  /* A1, 32xMSAA */
+    {   0,  0,  0,  0,  8,  8, 32, 1, 29, 2 },  /* L8, 32xMSAA */
+    {   0,  0,  0,  0,  1,  1, 32, 1, 30, 2 },  /* L1, 32xMSAA */
+
+    /* Configs without mask (mask=0) */
+    {   8,  8,  8,  8,  0, 32,  1, 0, 31, 1 },  /* RGB888, A8 */
+    {   8,  8,  8,  0,  0, 32,  1, 0, 32, 1 },  /* RGB888 */
+    {   5,  5,  5,  1,  0, 16,  1, 0, 33, 1 },  /* RGB555, A1 */
+    {   5,  6,  5,  0,  0, 16,  1, 0, 34, 1 },  /* RGB565 */
+    {   4,  4,  4,  4,  0, 16,  1, 0, 35, 1 },  /* RGB444, A4 */
+    {   0,  0,  0,  8,  0,  8,  1, 0, 36, 1 },  /* A8 */
+    {   0,  0,  0,  4,  0,  4,  1, 0, 37, 1 },  /* A4 */
+    {   0,  0,  0,  1,  0,  1,  1, 0, 38, 1 },  /* A1 */
+    {   0,  0,  0,  0,  8,  8,  1, 0, 39, 2 },  /* L8 */
+    {   0,  0,  0,  0,  1,  1,  1, 0, 40, 2 },  /* L1 */
+    {   8,  8,  8,  8,  0, 32,  4, 0, 41, 1 },  /* RGB888, A8, 4xMSAA */
+    {   8,  8,  8,  0,  0, 32,  4, 0, 42, 1 },  /* RGB888, 4xMSAA */
+    {   5,  5,  5,  1,  0, 16,  4, 0, 43, 1 },  /* RGB555, A1, 4xMSAA */
+    {   5,  6,  5,  0,  0, 16,  4, 0, 44, 1 },  /* RGB565, 4xMSAA */
+    {   4,  4,  4,  4,  0, 16,  4, 0, 45, 1 },  /* RGB444, A4, 4xMSAA */
+    {   0,  0,  0,  8,  0,  8,  4, 0, 46, 1 },  /* A8, 4xMSAA */
+    {   0,  0,  0,  4,  0,  4,  4, 0, 47, 1 },  /* A4, 4xMSAA */
+    {   0,  0,  0,  1,  0,  1,  4, 0, 48, 1 },  /* A1, 4xMSAA */
+    {   0,  0,  0,  0,  8,  8,  4, 0, 49, 2 },  /* L8, 4xMSAA */
+    {   0,  0,  0,  0,  1,  1,  4, 0, 50, 2 },  /* L1, 4xMSAA */
+    {   8,  8,  8,  8,  0, 32, 32, 0, 51, 1 },  /* RGB888, A8, 32xMSAA */
+    {   8,  8,  8,  0,  0, 32, 32, 0, 52, 1 },  /* RGB888, 32xMSAA */
+    {   5,  5,  5,  1,  0, 16, 32, 0, 53, 1 },  /* RGB555, A1, 32xMSAA */
+    {   5,  6,  5,  0,  0, 16, 32, 0, 54, 1 },  /* RGB565, 32xMSAA */
+    {   4,  4,  4,  4,  0, 16, 32, 0, 55, 1 },  /* RGB444, A4, 32xMSAA */
+    {   0,  0,  0,  8,  0,  8, 32, 0, 56, 1 },  /* A8, 32xMSAA */
+    {   0,  0,  0,  4,  0,  4, 32, 0, 57, 1 },  /* A4, 32xMSAA */
+    {   0,  0,  0,  1,  0,  1, 32, 0, 58, 1 },  /* A1, 32xMSAA */
+    {   0,  0,  0,  0,  8,  8, 32, 0, 59, 2 },  /* L8, 32xMSAA */
+    {   0,  0,  0,  0,  1,  1, 32, 0, 60, 2 },  /* L1, 32xMSAA */
+};
+
+#define CM_NUM_CONFIGS (int)(sizeof(g_configs) / sizeof(g_configs[0]))
 
 EGLint eglGetError(void)
 {
@@ -1072,10 +1146,67 @@ EGLBoolean eglGetConfigs(EGLDisplay dpy, EGLConfig *configs, EGLint config_size,
 {
     (void)dpy;
     if (!num_config) { EGL_SET_ERR(EGL_BAD_PARAMETER); return EGL_FALSE; }
-    *num_config = 1;
-    if (configs && config_size >= 1)
-        configs[0] = CM_EGL_CONFIG;
+    *num_config = CM_NUM_CONFIGS;
+    if (configs) {
+        int n = config_size < CM_NUM_CONFIGS ? config_size : CM_NUM_CONFIGS;
+        for (int i = 0; i < n; i++)
+            configs[i] = (EGLConfig)(uintptr_t)g_configs[i].id;
+    }
     return EGL_TRUE;
+}
+
+static int config_matches(const cm_egl_config_t *cfg, const EGLint *attrib_list)
+{
+    if (!attrib_list) return 1;
+    for (int i = 0; attrib_list[i] != EGL_NONE; i += 2) {
+        EGLint attr = attrib_list[i];
+        EGLint val  = attrib_list[i+1];
+        switch (attr) {
+        case EGL_CONFIG_ID:
+            if (cfg->id != val) return 0;
+            break;
+        case EGL_RED_SIZE:
+            if (cfg->r < val) return 0;
+            break;
+        case EGL_GREEN_SIZE:
+            if (cfg->g < val) return 0;
+            break;
+        case EGL_BLUE_SIZE:
+            if (cfg->b < val) return 0;
+            break;
+        case EGL_ALPHA_SIZE:
+            if (cfg->a < val) return 0;
+            break;
+        case EGL_LUMINANCE_SIZE:
+            if (cfg->l < val) return 0;
+            break;
+        case EGL_BUFFER_SIZE:
+            if (cfg->bpp < val) return 0;
+            break;
+        case EGL_ALPHA_MASK_SIZE:
+            if (cfg->maskBits < val) return 0;
+            break;
+        case EGL_SAMPLES:
+            if (cfg->samples < val) return 0;
+            break;
+        case EGL_SAMPLE_BUFFERS:
+            if (val == 0 && cfg->samples > 1) return 0;
+            if (val == 1 && cfg->samples <= 1) return 0;
+            break;
+        case EGL_COLOR_BUFFER_TYPE:
+            if (cfg->colorBufferType != val) return 0;
+            break;
+        case EGL_RENDERABLE_TYPE:
+            if (!(val & EGL_OPENVG_BIT)) return 0;
+            break;
+        case EGL_SURFACE_TYPE:
+            if (!(val & EGL_PBUFFER_BIT)) return 0;
+            break;
+        default:
+            break;
+        }
+    }
+    return 1;
 }
 
 EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list, EGLConfig *configs,
@@ -1084,57 +1215,55 @@ EGLBoolean eglChooseConfig(EGLDisplay dpy, const EGLint *attrib_list, EGLConfig 
     (void)dpy;
     if (!num_config) { EGL_SET_ERR(EGL_BAD_PARAMETER); return EGL_FALSE; }
 
-    /* Check for config ID filter */
-    if (attrib_list) {
-        for (int i = 0; attrib_list[i] != EGL_NONE; i += 2) {
-            if (attrib_list[i] == EGL_CONFIG_ID) {
-                if (attrib_list[i+1] != CM_EGL_CONFIG_ID) {
-                    *num_config = 0;
-                    return EGL_TRUE;
-                }
-            }
+    int count = 0;
+    for (int i = 0; i < CM_NUM_CONFIGS; i++) {
+        if (config_matches(&g_configs[i], attrib_list)) {
+            if (configs && count < config_size)
+                configs[count] = (EGLConfig)(uintptr_t)g_configs[i].id;
+            count++;
         }
     }
-    *num_config = 1;
-    if (configs && config_size >= 1)
-        configs[0] = CM_EGL_CONFIG;
+    *num_config = count;
     return EGL_TRUE;
+}
+
+static const cm_egl_config_t *find_config(EGLConfig config)
+{
+    int id = (int)(uintptr_t)config;
+    for (int i = 0; i < CM_NUM_CONFIGS; i++)
+        if (g_configs[i].id == id) return &g_configs[i];
+    return NULL;
 }
 
 EGLBoolean eglGetConfigAttrib(EGLDisplay dpy, EGLConfig config, EGLint attribute, EGLint *value)
 {
     (void)dpy;
-    if (config != CM_EGL_CONFIG || !value) {
+    const cm_egl_config_t *cfg = find_config(config);
+    if (!cfg || !value) {
         EGL_SET_ERR(EGL_BAD_CONFIG); return EGL_FALSE;
     }
     switch (attribute) {
-    case EGL_CONFIG_ID:             *value = CM_EGL_CONFIG_ID; break;
-    case EGL_RED_SIZE:              *value = 8; break;
-    case EGL_GREEN_SIZE:            *value = 8; break;
-    case EGL_BLUE_SIZE:             *value = 8; break;
-    case EGL_ALPHA_SIZE:            *value = 8; break;
-    case EGL_LUMINANCE_SIZE:        *value = 0; break;
-    case EGL_ALPHA_MASK_SIZE:       *value = 8; break;
-    case EGL_BUFFER_SIZE:           *value = 32; break;
+    case EGL_CONFIG_ID:             *value = cfg->id; break;
+    case EGL_RED_SIZE:              *value = cfg->r; break;
+    case EGL_GREEN_SIZE:            *value = cfg->g; break;
+    case EGL_BLUE_SIZE:             *value = cfg->b; break;
+    case EGL_ALPHA_SIZE:            *value = cfg->a; break;
+    case EGL_LUMINANCE_SIZE:        *value = cfg->l; break;
+    case EGL_ALPHA_MASK_SIZE:       *value = cfg->maskBits; break;
+    case EGL_BUFFER_SIZE:           *value = cfg->bpp; break;
     case EGL_DEPTH_SIZE:            *value = 0; break;
     case EGL_STENCIL_SIZE:          *value = 0; break;
-    case EGL_SAMPLE_BUFFERS:        *value = 0; break;
-    case EGL_SAMPLES:               *value = 0; break;
+    case EGL_SAMPLE_BUFFERS:        *value = (cfg->samples > 1) ? 1 : 0; break;
+    case EGL_SAMPLES:               *value = cfg->samples; break;
     case EGL_SURFACE_TYPE:
         *value = EGL_PBUFFER_BIT |
                  EGL_VG_COLORSPACE_LINEAR_BIT |
                  EGL_VG_ALPHA_FORMAT_PRE_BIT;
         break;
     case EGL_RENDERABLE_TYPE:       *value = EGL_OPENVG_BIT; break;
-    case EGL_CONFORMANT:
-#ifdef EGL_CONFORMANT_KHR
-        *value = EGL_OPENVG_BIT;
-#else
-        *value = EGL_OPENVG_BIT;
-#endif
-        break;
+    case EGL_CONFORMANT:            *value = EGL_OPENVG_BIT; break;
     case EGL_CONFIG_CAVEAT:         *value = EGL_NONE; break;
-    case EGL_COLOR_BUFFER_TYPE:     *value = EGL_RGB_BUFFER; break;
+    case EGL_COLOR_BUFFER_TYPE:     *value = cfg->colorBufferType; break;
     case EGL_LEVEL:                 *value = 0; break;
     case EGL_MAX_PBUFFER_WIDTH:     *value = 4096; break;
     case EGL_MAX_PBUFFER_HEIGHT:    *value = 4096; break;
@@ -1192,6 +1321,12 @@ EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config,
     surf->height    = h;
     surf->is_linear = is_linear;
     surf->is_premult = is_premult;
+    surf->config_id = (int)(uintptr_t)config;
+    /* Look up alpha bits from config table */
+    {
+        const cm_egl_config_t *cfg = find_config(config);
+        surf->alpha_bits = cfg ? cfg->a : 8;
+    }
     return (EGLSurface)surf;
 }
 
@@ -1279,7 +1414,7 @@ EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface surface, EGLint attribute,
     switch (attribute) {
     case EGL_WIDTH:  *value = surf->width;  break;
     case EGL_HEIGHT: *value = surf->height; break;
-    case EGL_CONFIG_ID: *value = CM_EGL_CONFIG_ID; break;
+    case EGL_CONFIG_ID: *value = surf->config_id; break;
     default: EGL_SET_ERR(EGL_BAD_ATTRIBUTE); return EGL_FALSE;
     }
     return EGL_TRUE;
@@ -1302,7 +1437,7 @@ EGLBoolean eglQueryContext(EGLDisplay dpy, EGLContext ctx, EGLint attribute, EGL
     (void)dpy; (void)ctx;
     if (!value) { EGL_SET_ERR(EGL_BAD_PARAMETER); return EGL_FALSE; }
     switch (attribute) {
-    case EGL_CONFIG_ID:          *value = CM_EGL_CONFIG_ID; break;
+    case EGL_CONFIG_ID:          *value = g_ctx && g_ctx->surface ? g_ctx->surface->config_id : 1; break;
     case EGL_CONTEXT_CLIENT_TYPE: *value = EGL_OPENVG_API; break;
     default: EGL_SET_ERR(EGL_BAD_ATTRIBUTE); return EGL_FALSE;
     }
@@ -2193,6 +2328,8 @@ void vgClear(VGint x, VGint y, VGint width, VGint height)
                            : (surf->is_premult ? VG_sRGBA_8888_PRE : VG_sRGBA_8888);
     cm_convert_color(clear_rgba, VG_sRGBA_8888, surf_fmt);
     uint32_t col = pack_rgba(clear_rgba);
+    /* RI convention: configs with alphaBits=0 store alpha=0xFF */
+    if (surf->alpha_bits == 0) col |= 0x000000FFu;
     uint32_t *fb = (uint32_t *)(uintptr_t)vg_cmodel_get_framebuffer(surf->cm, NULL, NULL);
     if (!fb) return;
 
@@ -4175,8 +4312,9 @@ static void draw_stroke(cm_ctx_t *ctx, cm_path_t *src_path)
         uint32_t aa_hw = (ctx->rendering_quality == VG_RENDERING_QUALITY_NONANTIALIASED)
                          ? VG_AA_NONE : VG_AA_8X;
         vg_cmodel_reg_write(cm, VG_REG_AA_SAMPLES, aa_hw);
-        vg_cmodel_reg_write(cm, VG_REG_SURF_LINEAR, (uint32_t)ctx->surface->is_linear);
-        vg_cmodel_reg_write(cm, VG_REG_SURF_PREMULT, (uint32_t)ctx->surface->is_premult);
+    vg_cmodel_reg_write(cm, VG_REG_SURF_LINEAR, (uint32_t)ctx->surface->is_linear);
+    vg_cmodel_reg_write(cm, VG_REG_SURF_PREMULT, (uint32_t)ctx->surface->is_premult);
+    vg_cmodel_reg_write(cm, VG_REG_SURF_ALPHA_BITS, (uint32_t)ctx->surface->alpha_bits);
 
         /* Transform (same path matrix) */
         load_matrix_to_cmodel(ctx);
@@ -4241,6 +4379,7 @@ void vgDrawPath(VGPath path, VGbitfield paintModes)
     vg_cmodel_reg_write(cm, VG_REG_AA_SAMPLES, aa_hw);
     vg_cmodel_reg_write(cm, VG_REG_SURF_LINEAR, (uint32_t)g_ctx->surface->is_linear);
     vg_cmodel_reg_write(cm, VG_REG_SURF_PREMULT, (uint32_t)g_ctx->surface->is_premult);
+    vg_cmodel_reg_write(cm, VG_REG_SURF_ALPHA_BITS, (uint32_t)g_ctx->surface->alpha_bits);
 
     /* Transform */
     load_matrix_to_cmodel(g_ctx);
