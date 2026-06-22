@@ -126,6 +126,7 @@
 #define VG_REG_SURF_LINEAR      0x224   /* 0=sRGB, 1=linear RGB             */
 #define VG_REG_SURF_PREMULT     0x228   /* 0=non-premultiplied, 1=premul    */
 #define VG_REG_SURF_ALPHA_BITS  0x22C   /* alpha bits in surface (0,1,4,8)  */
+#define VG_REG_SURF_LUM_BITS    0x270   /* luminance bits in surface (0,4,8) */
 #define VG_REG_COLOR_XFORM_EN   0x230   /* Apply post-sample color xform    */
 #define VG_REG_COLOR_XFORM_0    0x234   /* scale R                          */
 #define VG_REG_COLOR_XFORM_1    0x238   /* scale G                          */

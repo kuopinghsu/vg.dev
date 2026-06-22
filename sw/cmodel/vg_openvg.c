@@ -75,6 +75,8 @@ typedef struct cm_paint_s {
     VGfloat     rad[5];            /* cx,cy,fx,fy,r radial gradient */
     int         num_stops;
     struct { VGfloat offset; VGfloat color[4]; } stops[CM_MAX_STOPS];
+    int         input_num_stops;
+    struct { VGfloat offset; VGfloat color[4]; } input_stops[CM_MAX_STOPS];
     VGColorRampSpreadMode spread_mode;
     VGboolean   ramp_premultiplied;
     VGTilingMode          tiling_mode;
@@ -258,6 +260,7 @@ typedef struct cm_surface_s {
     int          is_premult;  /* 0=non-pre  1=pre */
     int          config_id;   /* EGL config ID */
     int          alpha_bits;  /* alpha channel bits (0,1,4,8) */
+    int          lum_bits;    /* luminance bits (0,4,8) */
     uint8_t     *mask_buf;    /* alpha8 mask buffer, row 0 = top, NULL if not allocated */
 } cm_surface_t;
 
@@ -292,6 +295,7 @@ typedef struct cm_ctx_s {
 
     int            color_transform;
     VGfloat        color_transform_values[8];
+    VGfloat        input_color_transform_values[8];
 
     int            scissoring;
     VGint          scissor_rects[CM_MAX_SCISSOR * 4];
@@ -304,6 +308,7 @@ typedef struct cm_ctx_s {
     int            pixel_layout;
     int            image_quality;
     VGfloat        glyph_origin[2];
+    VGfloat        input_glyph_origin[2];
     VGfloat        tile_fill_color[4];
 } cm_ctx_t;
 
@@ -351,10 +356,19 @@ static cm_paint_t g_default_stroke_paint;
  * Error helpers
  * ========================================================================= */
 
-/* Per OpenVG spec: first error since last vgGetError() is preserved; do not override. */
-#define VG_SET_ERR(e)  do { if (g_ctx && g_ctx->error == VG_NO_ERROR) g_ctx->error = (e); } while(0)
+/* Match RI behavior: unconditionally set error (RI overwrites m_error on every setError call) */
+#define VG_SET_ERR(e)  do { if (g_ctx) g_ctx->error = (e); } while(0)
 #define EGL_SET_ERR(e) do { g_egl_error = (e); } while(0)
 #define VG_CHECK_CTX(...) do { if (!g_ctx) return __VA_ARGS__; } while(0)
+
+/* Floor-based float→int conversion matching RI's inputFloatToInt (riApi.cpp:177) */
+static inline VGint cm_floor_to_int(VGfloat value)
+{
+    double v = (double)floor((double)value);
+    if (v > 2147483647.0)  v = 2147483647.0;
+    if (v < -2147483648.0) v = -2147483648.0;
+    return (VGint)v;
+}
 
 /* =========================================================================
  * Matrix helpers
@@ -431,20 +445,10 @@ static void load_matrix_to_cmodel(cm_ctx_t *ctx)
     float tx  = m[6];    /* col2,row0 */
     float ty  = m[7];    /* col2,row1 */
 
-    /* Apply Y-flip: y_cmodel = H - 1 - y_openvg
-     * composed matrix:
-     *   SX'  = sx
-     *   SHX' = shx
-     *   TX'  = tx
-     *   SHY' = -shy
-     *   SY'  = -sy
-     *   TY'  = (H-1) - ty  + ... more precisely (H-1)*1 - (shy*0 + sy*0 + ty)
-     *        = (H - 1) + shy*0 - ty  no...
-     *
-     * flip_y * m means: new_x = m11*x + m12*y + m13
-     *                   new_y = -m21*x - m22*y - m23 + H  (where H = surface height)
-     * So: SY' = -sy, SHY' = -shy, TY' = H - ty
-     */
+    /* Apply Y-flip: y_cmodel = H - 1 - y_openvg.
+     * The cmodel stores the framebuffer with y=0 at the top, and the
+     * pixel reading functions use H-1-y for coordinate conversion.
+     * The RI doesn't flip, causing B10103 boundary mismatches. */
     vg_cmodel_t cm = ctx->surface->cm;
     vg_cmodel_reg_write_f(cm, VG_REG_MATRIX_SX,  sx);
     vg_cmodel_reg_write_f(cm, VG_REG_MATRIX_SHX, shx);
@@ -1005,6 +1009,7 @@ static void ctx_init_defaults(cm_ctx_t *ctx, cm_surface_t *surface)
     ctx->color_transform_values[5] = 0.f;
     ctx->color_transform_values[6] = 0.f;
     ctx->color_transform_values[7] = 0.f;
+    memcpy(ctx->input_color_transform_values, ctx->color_transform_values, sizeof(ctx->input_color_transform_values));
 
     /* Default paints */
     memset(&g_default_fill_paint,   0, sizeof(cm_paint_t));
@@ -1326,6 +1331,7 @@ EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config,
     {
         const cm_egl_config_t *cfg = find_config(config);
         surf->alpha_bits = cfg ? cfg->a : 8;
+        surf->lum_bits = cfg ? cfg->l : 0;
     }
     return (EGLSurface)surf;
 }
@@ -1623,20 +1629,16 @@ void vgSetfv(VGParamType type, VGint count, const VGfloat *values)
         if (count % 4 != 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
         g_ctx->num_scissor_rects = 0;
         for (int i = 0; i < count && i < CM_MAX_SCISSOR*4; i++)
-            g_ctx->scissor_rects[i] = (VGint)values[i];
+            g_ctx->scissor_rects[i] = cm_floor_to_int(values[i]);
         g_ctx->num_scissor_rects = count / 4;
         break;
     case VG_COLOR_TRANSFORM_VALUES:
         if (count != 8) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-        for (int i = 0; i < 4; i++) {
-            float s = values[i];
-            float b = values[i + 4];
-            if (s < -127.f) s = -127.f;
-            if (s >  127.f) s =  127.f;
-            if (b < -1.f)   b = -1.f;
-            if (b >  1.f)   b =  1.f;
-            g_ctx->color_transform_values[i] = s;
-            g_ctx->color_transform_values[i + 4] = b;
+        for (int i = 0; i < 8; i++) {
+            g_ctx->input_color_transform_values[i] = values[i];
+            VGfloat v = values[i];
+            if (v != v) v = 0.f; /* NaN → 0 */
+            g_ctx->color_transform_values[i] = v;
         }
         break;
     case VG_STROKE_DASH_PATTERN:
@@ -1654,8 +1656,13 @@ void vgSetfv(VGParamType type, VGint count, const VGfloat *values)
         break;
     case VG_GLYPH_ORIGIN:
         if (count != 2) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-        g_ctx->glyph_origin[0] = values[0];
-        g_ctx->glyph_origin[1] = values[1];
+        g_ctx->input_glyph_origin[0] = values[0];
+        g_ctx->input_glyph_origin[1] = values[1];
+        for (int i = 0; i < 2; i++) {
+            VGfloat v = values[i];
+            if (v != v) v = 0.f; /* NaN → 0 */
+            g_ctx->glyph_origin[i] = v;
+        }
         break;
     default:
         /* scalar parameter — count must be exactly 1 */
@@ -1679,6 +1686,16 @@ void vgSetiv(VGParamType type, VGint count, const VGint *values)
             g_ctx->scissor_rects[i] = values[i];
         g_ctx->num_scissor_rects = count / 4;
         break;
+    case VG_GLYPH_ORIGIN:
+        if (count != 2) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
+        g_ctx->input_glyph_origin[0] = (VGfloat)values[0];
+        g_ctx->input_glyph_origin[1] = (VGfloat)values[1];
+        for (int i = 0; i < 2; i++) {
+            VGfloat v = (VGfloat)values[i];
+            if (v != v) v = 0.f;
+            g_ctx->glyph_origin[i] = v;
+        }
+        break;
     case VG_TILE_FILL_COLOR:
         if (count != 4) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
         for (int i = 0; i < 4; i++) g_ctx->tile_fill_color[i] = (VGfloat)values[i];
@@ -1689,15 +1706,11 @@ void vgSetiv(VGParamType type, VGint count, const VGint *values)
         break;
     case VG_COLOR_TRANSFORM_VALUES:
         if (count != 8) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-        for (int i = 0; i < 4; i++) {
-            float s = (VGfloat)values[i];
-            float b = (VGfloat)values[i + 4];
-            if (s < -127.f) s = -127.f;
-            if (s >  127.f) s =  127.f;
-            if (b < -1.f)   b = -1.f;
-            if (b >  1.f)   b =  1.f;
-            g_ctx->color_transform_values[i] = s;
-            g_ctx->color_transform_values[i + 4] = b;
+        for (int i = 0; i < 8; i++) {
+            VGfloat v = (VGfloat)values[i];
+            g_ctx->input_color_transform_values[i] = v;
+            if (v != v) v = 0.f; /* NaN → 0 */
+            g_ctx->color_transform_values[i] = v;
         }
         break;
     case VG_STROKE_DASH_PATTERN:
@@ -1756,13 +1769,14 @@ VGint vgGeti(VGParamType type)
     case VG_MAX_IMAGE_HEIGHT:      return 4096;
     case VG_MAX_IMAGE_PIXELS:      return 4096*4096;
     case VG_MAX_IMAGE_BYTES:       return 4096*4096*4;
+    case VG_MAX_FLOAT:             return 2147483647;
     case VG_MAX_GAUSSIAN_STD_DEVIATION: return 16;
     case VG_PIXEL_LAYOUT:          return g_ctx->pixel_layout;
     case VG_SCREEN_LAYOUT:         return VG_PIXEL_LAYOUT_UNKNOWN;
     /* Float params accessible via vgGeti */
-    case VG_STROKE_LINE_WIDTH:     return (VGint)g_ctx->stroke_line_width;
-    case VG_STROKE_MITER_LIMIT:    return (VGint)g_ctx->stroke_miter_limit;
-    case VG_STROKE_DASH_PHASE:     return (VGint)g_ctx->stroke_dash_phase;
+    case VG_STROKE_LINE_WIDTH:     return cm_floor_to_int(g_ctx->stroke_line_width);
+    case VG_STROKE_MITER_LIMIT:    return cm_floor_to_int(g_ctx->stroke_miter_limit);
+    case VG_STROKE_DASH_PHASE:     return cm_floor_to_int(g_ctx->stroke_dash_phase);
     default: VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return 0;
     }
 }
@@ -1829,7 +1843,7 @@ void vgGetfv(VGParamType type, VGint count, VGfloat *values)
         for (int i = 0; i < count && i < 4; i++) values[i] = g_ctx->clear_color[i];
         break;
     case VG_COLOR_TRANSFORM_VALUES:
-        for (int i = 0; i < count && i < 8; i++) values[i] = g_ctx->color_transform_values[i];
+        for (int i = 0; i < count && i < 8; i++) values[i] = g_ctx->input_color_transform_values[i];
         break;
     case VG_STROKE_DASH_PATTERN:
         for (int i = 0; i < count && i < g_ctx->num_dash; i++)
@@ -1839,7 +1853,7 @@ void vgGetfv(VGParamType type, VGint count, VGfloat *values)
         for (int i = 0; i < count && i < 4; i++) values[i] = g_ctx->tile_fill_color[i];
         break;
     case VG_GLYPH_ORIGIN:
-        for (int i = 0; i < count && i < 2; i++) values[i] = g_ctx->glyph_origin[i];
+        for (int i = 0; i < count && i < 2; i++) values[i] = g_ctx->input_glyph_origin[i];
         break;
     case VG_SCISSOR_RECTS:
         for (int i = 0; i < count && i < g_ctx->num_scissor_rects*4; i++)
@@ -1867,20 +1881,20 @@ void vgGetiv(VGParamType type, VGint count, VGint *values)
             values[i] = g_ctx->scissor_rects[i];
         break;
     case VG_TILE_FILL_COLOR:
-        for (int i = 0; i < count && i < 4; i++) values[i] = (VGint)g_ctx->tile_fill_color[i];
+        for (int i = 0; i < count && i < 4; i++) values[i] = cm_floor_to_int(g_ctx->tile_fill_color[i]);
         break;
     case VG_CLEAR_COLOR:
-        for (int i = 0; i < count && i < 4; i++) values[i] = (VGint)g_ctx->clear_color[i];
+        for (int i = 0; i < count && i < 4; i++) values[i] = cm_floor_to_int(g_ctx->clear_color[i]);
         break;
     case VG_COLOR_TRANSFORM_VALUES:
-        for (int i = 0; i < count && i < 8; i++) values[i] = (VGint)g_ctx->color_transform_values[i];
+        for (int i = 0; i < count && i < 8; i++) values[i] = cm_floor_to_int(g_ctx->input_color_transform_values[i]);
         break;
     case VG_GLYPH_ORIGIN:
-        for (int i = 0; i < count && i < 2; i++) values[i] = (VGint)g_ctx->glyph_origin[i];
+        for (int i = 0; i < count && i < 2; i++) values[i] = cm_floor_to_int(g_ctx->input_glyph_origin[i]);
         break;
     case VG_STROKE_DASH_PATTERN:
         for (int i = 0; i < count && i < g_ctx->num_dash; i++)
-            values[i] = (VGint)g_ctx->stroke_dash_pattern[i];
+            values[i] = cm_floor_to_int(g_ctx->stroke_dash_pattern[i]);
         break;
     default:
         if (count >= 1) values[0] = vgGeti(type);
@@ -2169,7 +2183,9 @@ void vgRenderToMask(VGPath path, VGbitfield paintModes, VGMaskOperation op)
     uint32_t blend_hw = (uint32_t)(VG_BLEND_SRC - VG_BLEND_SRC); /* = 0 = SRC */
     vg_cmodel_reg_write(cm, VG_REG_BLEND_MODE, blend_hw);
     uint32_t aa_hw = (g_ctx->rendering_quality == VG_RENDERING_QUALITY_NONANTIALIASED)
-                     ? VG_AA_NONE : VG_AA_8X;
+                     ? VG_AA_NONE
+                     : (g_ctx->rendering_quality == VG_RENDERING_QUALITY_BETTER)
+                       ? VG_AA_8X : VG_AA_4X;
     vg_cmodel_reg_write(cm, VG_REG_AA_SAMPLES, aa_hw);
     uint32_t fill_rule = (g_ctx->fill_rule == VG_EVEN_ODD)
                          ? VG_REG_FILL_EVEN_ODD : VG_REG_FILL_NON_ZERO;
@@ -3829,7 +3845,9 @@ static void add_arc_pts(ptlist_t *l, sv2 ctr, float r, float a0, float a1, int c
     /* normalise sweep direction */
     if(ccw){  if(dang < 0.f) dang += 2.f*(float)M_PI; }
     else    { if(dang > 0.f) dang -= 2.f*(float)M_PI; }
-    int ns = (int)(fabsf(dang)/0.1f) + 1; if(ns>64)ns=64; if(ns<1)ns=1;
+    /* RI uses 5.0 degrees = 0.0873 radians tessellation angle */
+    const float tess_angle = 5.0f * (float)M_PI / 180.0f;
+    int ns = (int)(fabsf(dang) / tess_angle) + 1; if(ns>64)ns=64; if(ns<1)ns=1;
     for(int i=1;i<=ns;i++){
         float a = a0 + dang*(float)i/(float)ns;
         ptl_push(l, SV2(ctr.x + cosf(a)*r, ctr.y + sinf(a)*r));
@@ -4310,11 +4328,14 @@ static void draw_stroke(cm_ctx_t *ctx, cm_path_t *src_path)
 
         /* AA */
         uint32_t aa_hw = (ctx->rendering_quality == VG_RENDERING_QUALITY_NONANTIALIASED)
-                         ? VG_AA_NONE : VG_AA_8X;
+                         ? VG_AA_NONE
+                         : (ctx->rendering_quality == VG_RENDERING_QUALITY_BETTER)
+                           ? VG_AA_8X : VG_AA_4X;
         vg_cmodel_reg_write(cm, VG_REG_AA_SAMPLES, aa_hw);
     vg_cmodel_reg_write(cm, VG_REG_SURF_LINEAR, (uint32_t)ctx->surface->is_linear);
     vg_cmodel_reg_write(cm, VG_REG_SURF_PREMULT, (uint32_t)ctx->surface->is_premult);
     vg_cmodel_reg_write(cm, VG_REG_SURF_ALPHA_BITS, (uint32_t)ctx->surface->alpha_bits);
+    vg_cmodel_reg_write(cm, VG_REG_SURF_LUM_BITS, (uint32_t)ctx->surface->lum_bits);
 
         /* Transform (same path matrix) */
         load_matrix_to_cmodel(ctx);
@@ -4375,11 +4396,14 @@ void vgDrawPath(VGPath path, VGbitfield paintModes)
 
     /* AA — use NONE (single pixel-centre sample) for NONANTIALIASED quality */
     uint32_t aa_hw = (g_ctx->rendering_quality == VG_RENDERING_QUALITY_NONANTIALIASED)
-                     ? VG_AA_NONE : VG_AA_8X;
+                     ? VG_AA_NONE
+                     : (g_ctx->rendering_quality == VG_RENDERING_QUALITY_BETTER)
+                       ? VG_AA_8X : VG_AA_4X;
     vg_cmodel_reg_write(cm, VG_REG_AA_SAMPLES, aa_hw);
     vg_cmodel_reg_write(cm, VG_REG_SURF_LINEAR, (uint32_t)g_ctx->surface->is_linear);
     vg_cmodel_reg_write(cm, VG_REG_SURF_PREMULT, (uint32_t)g_ctx->surface->is_premult);
     vg_cmodel_reg_write(cm, VG_REG_SURF_ALPHA_BITS, (uint32_t)g_ctx->surface->alpha_bits);
+    vg_cmodel_reg_write(cm, VG_REG_SURF_LUM_BITS, (uint32_t)g_ctx->surface->lum_bits);
 
     /* Transform */
     load_matrix_to_cmodel(g_ctx);
@@ -4520,10 +4544,13 @@ void vgPaintPattern(VGPaint paint, VGImage pattern)
 void vgSetParameterf(VGHandle obj, VGint ptype, VGfloat v)
 {
     if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    /* Image and font parameters are read-only */
+    /* Image, font, and path parameters are read-only — silently ignore */
     if (ptype == VG_IMAGE_FORMAT || ptype == VG_IMAGE_WIDTH ||
-        ptype == VG_IMAGE_HEIGHT || ptype == VG_FONT_NUM_GLYPHS) {
-        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
+        ptype == VG_IMAGE_HEIGHT || ptype == VG_FONT_NUM_GLYPHS ||
+        ptype == VG_PATH_FORMAT || ptype == VG_PATH_DATATYPE ||
+        ptype == VG_PATH_SCALE || ptype == VG_PATH_BIAS ||
+        ptype == VG_PATH_NUM_SEGMENTS || ptype == VG_PATH_NUM_COORDS) {
+        return;
     }
     cm_paint_t *pt = (cm_paint_t *)(uintptr_t)obj;
     switch (ptype) {
@@ -4550,27 +4577,15 @@ void vgSetParameterf(VGHandle obj, VGint ptype, VGfloat v)
 void vgSetParameteri(VGHandle obj, VGint ptype, VGint v)
 {
     if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
-    /* Image parameters are read-only */
-    if (ptype == VG_IMAGE_FORMAT || ptype == VG_IMAGE_WIDTH || ptype == VG_IMAGE_HEIGHT) {
-        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
-    }
-    /* Font parameters are read-only */
-    if (ptype == VG_FONT_NUM_GLYPHS) {
-        VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
-    }
-    cm_paint_t *pt = (cm_paint_t *)(uintptr_t)obj;
-    /* Try to handle as path capability too */
-    if (ptype == VG_PATH_CAPABILITY_APPEND_TO || ptype == VG_PATH_DATATYPE ||
-        ptype == VG_PATH_FORMAT) {
-        cm_path_t *pp = (cm_path_t *)(uintptr_t)obj;
-        if (ptype == VG_PATH_DATATYPE) {
-            if (v < VG_PATH_DATATYPE_S_8 || v > VG_PATH_DATATYPE_F) {
-                VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
-            }
-            pp->datatype = (VGPathDatatype)v;
-        }
+    /* Image, font, and read-only path parameters — silently ignore */
+    if (ptype == VG_IMAGE_FORMAT || ptype == VG_IMAGE_WIDTH || ptype == VG_IMAGE_HEIGHT ||
+        ptype == VG_FONT_NUM_GLYPHS ||
+        ptype == VG_PATH_FORMAT || ptype == VG_PATH_SCALE || ptype == VG_PATH_BIAS ||
+        ptype == VG_PATH_NUM_SEGMENTS || ptype == VG_PATH_NUM_COORDS ||
+        ptype == VG_PATH_DATATYPE) {
         return;
     }
+    cm_paint_t *pt = (cm_paint_t *)(uintptr_t)obj;
     switch (ptype) {
     case VG_PAINT_TYPE:
         if (v < VG_PAINT_TYPE_COLOR || v > VG_PAINT_TYPE_PATTERN) {
@@ -4636,6 +4651,17 @@ void vgSetParameterfv(VGHandle obj, VGint ptype, VGint count, const VGfloat *v)
         int ns = count / 5;
         int limit = (ns > CM_MAX_STOPS) ? CM_MAX_STOPS : ns;
 
+        /* Store raw input stops (returned by getter) */
+        pt->input_num_stops = limit;
+        for (int i = 0; i < limit; i++) {
+            pt->input_stops[i].offset = v[i*5];
+            pt->input_stops[i].color[0] = v[i*5+1];
+            pt->input_stops[i].color[1] = v[i*5+2];
+            pt->input_stops[i].color[2] = v[i*5+3];
+            pt->input_stops[i].color[3] = v[i*5+4];
+        }
+
+        /* Process stops for rendering (matches RI's processing) */
         int out = 0;
         int valid = 1;
         VGfloat prev_offset = -1e30f;
@@ -4761,6 +4787,15 @@ VGfloat vgGetParameterf(VGHandle obj, VGint ptype)
     case VG_PAINT_PATTERN_TILING_MODE: return (VGfloat)pt->tiling_mode;
     case VG_PATH_SCALE: return pp->scale;
     case VG_PATH_BIAS:  return pp->bias;
+    case VG_PATH_FORMAT:   return (VGfloat)VG_PATH_FORMAT_STANDARD;
+    case VG_PATH_DATATYPE: return (VGfloat)pp->datatype;
+    case VG_PATH_NUM_SEGMENTS: return (VGfloat)pp->num_segments;
+    case VG_PATH_NUM_COORDS:   return (VGfloat)pp->num_coords;
+    case VG_FONT_NUM_GLYPHS: {
+        cm_font_t *fm = (cm_font_t *)(uintptr_t)obj;
+        if (fm->magic != FONT_MAGIC) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return 0.f; }
+        return (VGfloat)fm->num_glyphs;
+    }
     default: VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return 0.f;
     }
 }
@@ -4793,8 +4828,8 @@ VGint vgGetParameteri(VGHandle obj, VGint ptype)
     case VG_PAINT_PATTERN_TILING_MODE: return (VGint)pt->tiling_mode;
     case VG_PATH_FORMAT:   return VG_PATH_FORMAT_STANDARD;
     case VG_PATH_DATATYPE: return (VGint)pp->datatype;
-    case VG_PATH_SCALE:    return (VGint)pp->scale;
-    case VG_PATH_BIAS:     return (VGint)pp->bias;
+    case VG_PATH_SCALE:    return cm_floor_to_int(pp->scale);
+    case VG_PATH_BIAS:     return cm_floor_to_int(pp->bias);
     case VG_PATH_NUM_SEGMENTS: return pp->num_segments;
     case VG_PATH_NUM_COORDS:   return pp->num_coords;
     default: VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return 0;
@@ -4840,7 +4875,7 @@ VGint vgGetParameterVectorSize(VGHandle obj, VGint ptype)
     case VG_PAINT_COLOR: return 4;
     case VG_PAINT_LINEAR_GRADIENT: return 4;
     case VG_PAINT_RADIAL_GRADIENT: return 5;
-    case VG_PAINT_COLOR_RAMP_STOPS: return pt->num_stops * 5;
+    case VG_PAINT_COLOR_RAMP_STOPS: return pt->input_num_stops * 5;
     default:
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return 0;
     }
@@ -4850,12 +4885,7 @@ void vgGetParameterfv(VGHandle obj, VGint ptype, VGint count, VGfloat *v)
 {
     if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     int vsize = vgGetParameterVectorSize(obj, ptype);
-    if (vsize <= 0) return;
-    if (count < 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-    if (count == 0) {
-        if (vsize == 1) VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
-        return;
-    }
+    if (count <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     if (!v || ((uintptr_t)v & (sizeof(VGfloat)-1u)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
@@ -4869,11 +4899,14 @@ void vgGetParameterfv(VGHandle obj, VGint ptype, VGint count, VGfloat *v)
     case VG_PAINT_RADIAL_GRADIENT:
         for (int i = 0; i < count && i < 5; i++) v[i] = pt->rad[i]; break;
     case VG_PAINT_COLOR_RAMP_STOPS:
-        for (int i = 0; i < count && i < pt->num_stops * 5; i++) {
+        for (int i = 0; i < count && i < pt->input_num_stops * 5; i++) {
             int si = i / 5;
             int ci = i % 5;
-            v[i] = (ci == 0) ? pt->stops[si].offset : pt->stops[si].color[ci - 1];
+            v[i] = (ci == 0) ? pt->input_stops[si].offset : pt->input_stops[si].color[ci - 1];
         }
+        break;
+    case VG_GLYPH_ORIGIN:
+        for (int i = 0; i < count && i < 2; i++) v[i] = g_ctx->input_glyph_origin[i];
         break;
     default:
         if (count >= 1) v[0] = vgGetParameterf(obj, ptype); break;
@@ -4884,12 +4917,7 @@ void vgGetParameteriv(VGHandle obj, VGint ptype, VGint count, VGint *v)
 {
     if (obj == VG_INVALID_HANDLE) { VG_SET_ERR(VG_BAD_HANDLE_ERROR); return; }
     int vsize = vgGetParameterVectorSize(obj, ptype);
-    if (vsize <= 0) return;
-    if (count < 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
-    if (count == 0) {
-        if (vsize == 1) VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR);
-        return;
-    }
+    if (count <= 0) { VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return; }
     if (!v || ((uintptr_t)v & (sizeof(VGint)-1u)) != 0) {
         VG_SET_ERR(VG_ILLEGAL_ARGUMENT_ERROR); return;
     }
@@ -4897,20 +4925,23 @@ void vgGetParameteriv(VGHandle obj, VGint ptype, VGint count, VGint *v)
     cm_paint_t *pt = (cm_paint_t *)(uintptr_t)obj;
     switch (ptype) {
     case VG_PAINT_COLOR:
-        for (int i = 0; i < count && i < 4; i++) v[i] = (VGint)pt->color[i];
+        for (int i = 0; i < count && i < 4; i++) v[i] = cm_floor_to_int(pt->color[i]);
         break;
     case VG_PAINT_LINEAR_GRADIENT:
-        for (int i = 0; i < count && i < 4; i++) v[i] = (VGint)pt->lin[i];
+        for (int i = 0; i < count && i < 4; i++) v[i] = cm_floor_to_int(pt->lin[i]);
         break;
     case VG_PAINT_RADIAL_GRADIENT:
-        for (int i = 0; i < count && i < 5; i++) v[i] = (VGint)pt->rad[i];
+        for (int i = 0; i < count && i < 5; i++) v[i] = cm_floor_to_int(pt->rad[i]);
         break;
     case VG_PAINT_COLOR_RAMP_STOPS:
-        for (int i = 0; i < count && i < pt->num_stops * 5; i++) {
+        for (int i = 0; i < count && i < pt->input_num_stops * 5; i++) {
             int si = i / 5;
             int ci = i % 5;
-            v[i] = (ci == 0) ? (VGint)pt->stops[si].offset : (VGint)pt->stops[si].color[ci - 1];
+            v[i] = (ci == 0) ? cm_floor_to_int(pt->input_stops[si].offset) : cm_floor_to_int(pt->input_stops[si].color[ci - 1]);
         }
+        break;
+    case VG_GLYPH_ORIGIN:
+        for (int i = 0; i < count && i < 2; i++) v[i] = cm_floor_to_int(g_ctx->input_glyph_origin[i]);
         break;
     default:
         if (count >= 1) v[0] = vgGetParameteri(obj, ptype);

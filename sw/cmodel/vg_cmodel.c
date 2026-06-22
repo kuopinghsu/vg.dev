@@ -786,6 +786,7 @@ done:
     if (subpath_open && (cur_x != sub_x || cur_y != sub_y)) {
         add_edge(cm, cur_x, cur_y, sub_x, sub_y);
     }
+
     return;
 }
 
@@ -939,6 +940,18 @@ static int edge_active_at_y(const Edge *e, float y)
 
 /* Edge function evaluation approach - no sorting needed */
 
+/* Hammersley radical inverse base-2 (for BETTER quality Gaussian sampling) */
+static double radicalInverseBase2(unsigned int i)
+{
+    if (i == 0) return 0.0;
+    double p = 0.0, f = 0.5;
+    for (unsigned int j = 0; j < 32; j++) {
+        if (i & (1u << j)) p += f;
+        f *= 0.5;
+    }
+    return p;
+}
+
 static void rasterize_band(struct vg_cmodel *cm, int ty,
                             Intercept *ints_scratch)
 {
@@ -953,6 +966,7 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
     uint32_t surf_linear = rf_read(cm, VG_REG_SURF_LINEAR);
     uint32_t surf_premul = rf_read(cm, VG_REG_SURF_PREMULT);
     uint32_t surf_alpha  = rf_read(cm, VG_REG_SURF_ALPHA_BITS);
+    uint32_t surf_lum    = rf_read(cm, VG_REG_SURF_LUM_BITS);
 
     int sc_en = (int)rf_read(cm, VG_REG_SCISSOR_EN);
     int sc_x  = (int)rf_read(cm, VG_REG_SCISSOR_X);
@@ -960,75 +974,88 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
     int sc_w  = (int)rf_read(cm, VG_REG_SCISSOR_W);
     int sc_h  = (int)rf_read(cm, VG_REG_SCISSOR_H);
 
-    int   n_sub;
-    float radius;
-    if (aa_mode == VG_AA_NONE) { n_sub = 1;     radius = 0.f;  }
-    else if (aa_mode == VG_AA_4X) { n_sub = 8;  radius = 0.5f; } /* 8-queen */
-    else                       { n_sub = 8;  radius = 0.5f; }
-    float step          = (n_sub > 1) ? (2.f * radius / (float)n_sub) : 0.f;
-    int   total_samples = n_sub;
-    /* Per-pixel sub-sample inside-counter for the current pixel-row.    */
-    /* Stored as float to avoid an extra int->float conversion later.    */
+    /* Precompute sample positions and weights per RI's sampling patterns.
+     * VG_AA_NONE (NONANTIALIASED): 1 sample at pixel center.
+     * VG_AA_4X (FASTER): 8-queen, 8 samples, equal weights, radius 0.5.
+     * VG_AA_8X (BETTER): Hammersley+Gaussian, 32 samples, radius 0.75. */
+    static float samp_x[32], samp_y[32], samp_w[32];
+    float sum_weights = 0.f;
+    int n_samples;
+
+    if (aa_mode == VG_AA_NONE) {
+        n_samples = 1;
+        samp_x[0] = 0.f; samp_y[0] = 0.f; samp_w[0] = 1.f;
+        sum_weights = 1.f;
+    } else if (aa_mode == VG_AA_4X) {
+        /* 8-queen pattern matching RI's FASTER quality */
+        static const int queen_x[8] = {3, 7, 0, 2, 5, 1, 6, 4};
+        n_samples = 8;
+        for (int i = 0; i < 8; i++) {
+            samp_x[i] = ((float)queen_x[i] + 0.5f) / 8.f - 0.5f;
+            samp_y[i] = ((float)i + 0.5f) / 8.f - 0.5f;
+            samp_w[i] = 1.f / 8.f;
+            sum_weights += samp_w[i];
+        }
+    } else {
+        /* Hammersley + Gaussian filter matching RI's BETTER quality */
+        n_samples = 32;
+        for (int i = 0; i < 32; i++) {
+            double hx = radicalInverseBase2((unsigned int)i);
+            double hy = ((double)i + 0.5) / 32.0;
+            double r = sqrt(hx) * 0.75;
+            samp_x[i] = (float)(r * sin(hy * 2.0 * M_PI));
+            samp_y[i] = (float)(r * cos(hy * 2.0 * M_PI));
+            samp_w[i] = (float)exp(-0.5 * (r / 0.75) * (r / 0.75));
+            sum_weights += samp_w[i];
+        }
+    }
+
     float *cov = cm->cov_row;
 
+    /* Precompute sample radius for AET building */
+    float sample_radius = 0.f;
+    if (aa_mode == VG_AA_4X) sample_radius = 0.5f;
+    else if (aa_mode == VG_AA_8X) sample_radius = 0.75f;
+
     for (int py = y0; py < y1; py++) {
-        /* Reset per-row coverage accumulator. */
         for (int i = 0; i < fb_w; i++) cov[i] = 0.f;
 
-        /* 8-queen sampling pattern (matches RI's FASTER quality) */
-        static const int queen_x[8] = {3, 7, 0, 2, 5, 1, 6, 4};
-        for (int sy = 0; sy < n_sub; sy++) {
-            float spy = (n_sub == 1)
-                            ? ((float)py + 0.5f)
-                            : ((float)py + 0.5f - radius + ((float)sy + 0.5f) * step);
+        /* Build AET once per scanline using sample radius to cover all
+         * sub-sample y positions (matches RI's approach). */
+        float cminy = (float)py + 0.5f - sample_radius;
+        float cmaxy = (float)py + 0.5f + sample_radius;
+        id_fifo_open_band(cm, ty);
+        int n_ints = 0;
+        int eid;
+        while ((eid = id_fifo_pop(cm)) >= 0) {
+            const Edge *e = &cm->edges[eid];
+            if (cmaxy >= fminf(e->y0, e->y1) && cminy < fmaxf(e->y0, e->y1))
+                ints_scratch[n_ints++].eid = eid;
+        }
 
-            /*
-             * (1) Build AET for this sub-row by streaming the band's
-             *     edge-IDs through the on-chip prefetch FIFO.  Re-open
-             *     the FIFO each sub-row pass (DMA cursor rewinds to the
-             *     band header's base).
-             */
-            id_fifo_open_band(cm, ty);
-            int n_ints = 0;
-            int eid;
-            while ((eid = id_fifo_pop(cm)) >= 0) {
-                const Edge *e = &cm->edges[eid];
-                if (!edge_active_at_y(e, spy)) continue;
-                ints_scratch[n_ints].eid = eid;
-                n_ints++;
-            }
+        /* Per-sample loop matching RI's fill(): for each sample s,
+         * compute (spx,spy), evaluate edges from pre-built AET. */
+        for (int s = 0; s < n_samples; s++) {
+            float spy = (float)py + 0.5f + samp_y[s];
 
-            /* (2) Evaluate edge functions for each sampling point. */
+            /* Evaluate edge functions for each pixel at this sample's x offset */
             for (int px = 0; px < fb_w; px++) {
-                int row_inside = 0;
-                for (int sx = 0; sx < n_sub; sx++) {
-                    /* 8-queen sample position */
-                    float spx = (n_sub == 1)
-                                    ? ((float)px + 0.5f)
-                                    : ((float)px + 0.5f - radius + ((float)queen_x[sx] + 0.5f) * step);
-                    float spy2 = spy;  /* spy already computed above */
+                float spx = (float)px + 0.5f + samp_x[s];
 
-                    /* Evaluate edge functions for all active edges (matches RI) */
-                    int winding = 0;
-                    for (int ei = 0; ei < n_ints; ei++) {
-                        const Edge *e = &cm->edges[ints_scratch[ei].eid];
-                        /* Check if sampling point is within edge's y-range */
-                        float eymin = fminf(e->y0, e->y1);
-                        float eymax = fmaxf(e->y0, e->y1);
-                        if (spy2 > eymin && spy2 <= eymax) {
-                            /* Evaluate edge function: side = sp.x * n.x + sp.y * n.y - cnst */
-                            float side = spx * e->nx + spy2 * e->ny - e->cnst;
-                            if (side <= 0.0f) {
-                                winding += e->dir;
-                            }
+                int winding = 0;
+                for (int ei = 0; ei < n_ints; ei++) {
+                    const Edge *e = &cm->edges[ints_scratch[ei].eid];
+                    if (spy >= fminf(e->y0, e->y1) && spy < fmaxf(e->y0, e->y1)) {
+                        float side = spx * e->nx + spy * e->ny - e->cnst;
+                        if (side <= 0.0f) {
+                            winding += e->dir;
                         }
                     }
-                    int inside = (fill_rule == VG_REG_FILL_EVEN_ODD)
-                                     ? (abs(winding) & 1)
-                                     : (winding != 0);
-                    row_inside += inside;
                 }
-                cov[px] += (float)row_inside;
+                int inside = (fill_rule == VG_REG_FILL_EVEN_ODD)
+                                 ? (abs(winding) & 1)
+                                 : (winding != 0);
+                cov[px] += inside ? samp_w[s] : 0.f;
             }
         }
 
@@ -1040,7 +1067,7 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
                     py < sc_y || py >= sc_y + sc_h)
                     continue;
             }
-            float coverage = cov[px] / (float)total_samples;
+            float coverage = cov[px] / sum_weights;
 
             uint32_t grad_type = rf_read(cm, VG_REG_GRAD_TYPE);
             RGBA_f src = eval_paint(cm, px + .5f, py + .5f);
@@ -1056,6 +1083,19 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
                 src.r = srgb_to_linear(clampf(src.r));
                 src.g = srgb_to_linear(clampf(src.g));
                 src.b = srgb_to_linear(clampf(src.b));
+            }
+
+            /* Luminance conversion: for configs with luminance bits,
+             * convert paint color to linear luminance and replicate
+             * to R=G=B=L, matching RI's lLA_PRE blend path. */
+            if (surf_lum > 0) {
+                float r_lin = surf_linear ? clampf(src.r) : srgb_to_linear(clampf(src.r));
+                float g_lin = surf_linear ? clampf(src.g) : srgb_to_linear(clampf(src.g));
+                float b_lin = surf_linear ? clampf(src.b) : srgb_to_linear(clampf(src.b));
+                float L = 0.2126f * r_lin + 0.7152f * g_lin + 0.0722f * b_lin;
+                src.r = L;
+                src.g = L;
+                src.b = L;
             }
 
             /* Mask is folded into the coverage scalar (linear-light
@@ -1076,23 +1116,26 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
             RGBA_f dst = u32_to_rgbaf(*dst_px);
             /* RI convention: configs with alphaBits=0 unpack alpha as 1.0 */
             if (surf_alpha == 0) dst.a = 1.0f;
-            if (surf_premul && dst.a > 1e-6f) {
-                float ia = 1.f / dst.a;
-                dst.r *= ia;
-                dst.g *= ia;
-                dst.b *= ia;
+
+            /* Premultiply source (paint color) — RI blend modes are
+             * defined in premultiplied alpha space per the OpenVG spec. */
+            src.r *= src.a;
+            src.g *= src.a;
+            src.b *= src.a;
+
+            /* For NONPRE surfaces, premultiply dst for blending.
+             * For PRE surfaces, dst is already premultiplied. */
+            if (!surf_premul && dst.a > 1e-6f) {
+                dst.r *= dst.a;
+                dst.g *= dst.a;
+                dst.b *= dst.a;
             }
 
-            /* Blend in the destination (sRGB) byte space, exactly like
-             * the OpenVG RI does inside Color::blend.  Source is the
-             * raw paint sample; coverage/mask are NOT folded in here. */
+            /* Blend in premultiplied alpha space, matching RI's
+             * Color::blend which operates on premultiplied values. */
             RGBA_f r = blend_pixel(blend_mode, src, dst);
 
-            /* Anti-aliasing combine in linear-light space: the RI
-             * converts both the blended result and the original dst
-             * back to lRGBA_PRE before mixing by coverage, then back
-             * to sRGB.  This is what makes partial-coverage / partial
-             * mask pixels match RI bit-for-bit. */
+            /* Anti-aliasing combine in linear-light space */
             float r_lr = surf_linear ? clampf(r.r) : srgb_to_linear(clampf(r.r));
             float r_lg = surf_linear ? clampf(r.g) : srgb_to_linear(clampf(r.g));
             float r_lb = surf_linear ? clampf(r.b) : srgb_to_linear(clampf(r.b));
@@ -1105,11 +1148,13 @@ static void rasterize_band(struct vg_cmodel *cm, int ty,
             float o_lb = r_lb * coverage + d_lb * (1.f - coverage);
             float o_a  = r.a  * coverage + dst.a * (1.f - coverage);
 
-            /* RI stores zero RGB for fully transparent non-premultiplied pixels. */
-            if (!surf_premul && o_a <= 1e-6f) {
-                o_lr = 0.f;
-                o_lg = 0.f;
-                o_lb = 0.f;
+            /* For NONPRE surfaces, un-premultiply for storage.
+             * For PRE surfaces, output stays premultiplied. */
+            if (!surf_premul && o_a > 1e-6f) {
+                float ia = 1.f / o_a;
+                o_lr *= ia;
+                o_lg *= ia;
+                o_lb *= ia;
             }
 
             float out_r = surf_linear ? clampf(o_lr) : clampf(linear_to_srgb(o_lr));
@@ -1427,34 +1472,36 @@ static RGBA_f eval_paint(struct vg_cmodel *cm, float px, float py)
 static RGBA_f blend_pixel(uint32_t blend_mode,
                            RGBA_f src, RGBA_f dst)
 {
+    /* All blend modes operate in premultiplied alpha space per the
+     * OpenVG spec.  Both src and dst are already premultiplied here. */
     RGBA_f out;
     float sa = src.a, da = dst.a;
     switch (blend_mode) {
     case VG_REG_BLEND_SRC:
         return src;
     case VG_REG_BLEND_SRC_OVER:
-        out.r = src.r * sa + dst.r * da * (1.f - sa);
-        out.g = src.g * sa + dst.g * da * (1.f - sa);
-        out.b = src.b * sa + dst.b * da * (1.f - sa);
+        out.r = src.r + dst.r * (1.f - sa);
+        out.g = src.g + dst.g * (1.f - sa);
+        out.b = src.b + dst.b * (1.f - sa);
         out.a = sa + da * (1.f - sa);
-        if (out.a > 1e-6f) { out.r /= out.a; out.g /= out.a; out.b /= out.a; }
         return out;
     case VG_REG_BLEND_DST_OVER:
-        out.r = dst.r * da + src.r * sa * (1.f - da);
-        out.g = dst.g * da + src.g * sa * (1.f - da);
-        out.b = dst.b * da + src.b * sa * (1.f - da);
+        out.r = dst.r + src.r * (1.f - da);
+        out.g = dst.g + src.g * (1.f - da);
+        out.b = dst.b + src.b * (1.f - da);
         out.a = da + sa * (1.f - da);
-        if (out.a > 1e-6f) { out.r /= out.a; out.g /= out.a; out.b /= out.a; }
         return out;
     case VG_REG_BLEND_MULTIPLY:
-        out.r = src.r * dst.r; out.g = src.g * dst.g;
-        out.b = src.b * dst.b; out.a = clampf(sa + da - sa * da);
+        out.r = src.r * da + dst.r * sa - src.r * dst.r;
+        out.g = src.g * da + dst.g * sa - src.g * dst.g;
+        out.b = src.b * da + dst.b * sa - src.b * dst.b;
+        out.a = sa + da - sa * da;
         return out;
     case VG_REG_BLEND_SCREEN:
         out.r = src.r + dst.r - src.r * dst.r;
         out.g = src.g + dst.g - src.g * dst.g;
         out.b = src.b + dst.b - src.b * dst.b;
-        out.a = clampf(sa + da - sa * da);
+        out.a = sa + da - sa * da;
         return out;
     case VG_REG_BLEND_ADDITIVE:
         out.r = clampf(src.r + dst.r);
